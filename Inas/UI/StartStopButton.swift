@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Thiago Macedo
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import SwiftUI
 
 struct StartStopButton: View {
@@ -5,7 +8,6 @@ struct StartStopButton: View {
     let action: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var spinAngle: Double = 0
     @State private var pulse = false
 
     private var isConnecting: Bool {
@@ -39,15 +41,19 @@ struct StartStopButton: View {
                     .strokeBorder(.white.opacity(0.22), lineWidth: 2)
 
                 if isConnecting {
-                    Circle()
-                        .trim(from: 0.08, to: 0.42)
-                        .stroke(
-                            .white,
-                            style: StrokeStyle(lineWidth: 5, lineCap: .round)
-                        )
-                        .padding(7)
-                        .rotationEffect(.degrees(spinAngle))
-                        .accessibilityHidden(true)
+                    TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { timeline in
+                        let turns = timeline.date.timeIntervalSinceReferenceDate / 0.85
+                        let angle = reduceMotion ? 0.0 : (turns.truncatingRemainder(dividingBy: 1) * 360)
+                        Circle()
+                            .trim(from: 0.08, to: 0.42)
+                            .stroke(
+                                .white,
+                                style: StrokeStyle(lineWidth: 5, lineCap: .round)
+                            )
+                            .padding(7)
+                            .rotationEffect(.degrees(angle))
+                            .accessibilityHidden(true)
+                    }
                 }
 
                 VStack(spacing: 6) {
@@ -69,13 +75,16 @@ struct StartStopButton: View {
         .accessibilityValue(accessibilityValue)
         .accessibilityAddTraits(.startsMediaSession)
         .onChange(of: isConnecting) { _, connecting in
-            updateSpin(connecting)
+            if connecting {
+                pulse = false
+            } else {
+                updatePulse(isLive)
+            }
         }
         .onChange(of: isLive) { _, live in
             updatePulse(live)
         }
         .onAppear {
-            updateSpin(isConnecting)
             updatePulse(isLive)
         }
     }
@@ -86,19 +95,6 @@ struct StartStopButton: View {
         case .starting: "Connecting"
         case .sharing: "Sharing is on"
         case .stopping: "Stopping"
-        }
-    }
-
-    private func updateSpin(_ connecting: Bool) {
-        if reduceMotion || !connecting {
-            withAnimation(.easeOut(duration: 0.2)) {
-                spinAngle = 0
-            }
-            return
-        }
-        spinAngle = 0
-        withAnimation(.linear(duration: 0.85).repeatForever(autoreverses: false)) {
-            spinAngle = 360
         }
     }
 

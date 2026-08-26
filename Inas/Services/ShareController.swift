@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Thiago Macedo
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import Foundation
 import Observation
 import UIKit
@@ -25,6 +28,7 @@ final class ShareController {
     private let store = CredentialStore()
     private let server = SMBServer()
     private let bonjour = BonjourAdvertiser()
+    private let windowsDiscovery = WindowsDiscovery()
     private let background = BackgroundShareKeeper()
     private var statsTimer: Timer?
 
@@ -77,7 +81,7 @@ final class ShareController {
         state = .starting
 
         let root = documentsURL
-        let host = UIDevice.current.name
+        let host = WindowsDiscovery.hostName
         let server = self.server
         Task.detached {
             do {
@@ -89,6 +93,7 @@ final class ShareController {
                         self.showPassword = true
                     }
                     self.bonjour.start(port: port)
+                    self.windowsDiscovery.start(ip: ip, port: port)
                     self.background.sharingDidStart { [weak self] in
                         self?.stop(notify: true)
                     }
@@ -109,6 +114,7 @@ final class ShareController {
         statsTimer?.invalidate()
         statsTimer = nil
         bonjour.stop()
+        windowsDiscovery.stop()
         background.sharingDidStop()
         let server = self.server
         Task.detached {
@@ -174,7 +180,8 @@ final class ShareController {
 
         Tap Start in iNAS, then connect from another device:
 
-          smb://<this-device-ip>/inas
+          Mac:     smb://<this-device-ip>/inas
+          Windows: \\\\<this-device-ip>\\inas
 
         Default user is inas. Use the password shown on the iNAS screen.
         """

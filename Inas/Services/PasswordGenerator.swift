@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Thiago Macedo
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import Foundation
 import Security
 
@@ -26,9 +29,16 @@ enum PasswordGenerator {
     }
 
     private static func randomIndex(_ upper: Int) -> Int {
-        var byte: UInt8 = 0
-        let status = SecRandomCopyBytes(kSecRandomDefault, 1, &byte)
-        precondition(status == errSecSuccess, "SecRandomCopyBytes failed")
-        return Int(byte) % upper
+        precondition(upper > 0 && upper <= 256)
+        let limit = 256 - (256 % upper)
+        while true {
+            var byte: UInt8 = 0
+            let status = SecRandomCopyBytes(kSecRandomDefault, 1, &byte)
+            precondition(status == errSecSuccess, "SecRandomCopyBytes failed")
+            let value = Int(byte)
+            if value < limit {
+                return value % upper
+            }
+        }
     }
 }

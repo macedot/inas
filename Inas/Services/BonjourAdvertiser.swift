@@ -1,33 +1,26 @@
-import Foundation
-import Network
+// Copyright (C) 2026 Thiago Macedo
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
-final class BonjourAdvertiser {
-    private var listener: NWListener?
+import Foundation
+
+final class BonjourAdvertiser: NSObject, NetServiceDelegate {
+    static let serviceName = "iNAS"
+
+    private var netService: NetService?
 
     func start(port: UInt16) {
         stop()
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
-        do {
-            let listener = try NWListener(using: .tcp, on: nwPort)
-            listener.service = NWListener.Service(name: "iNAS", type: "_smb._tcp")
-            // We already bind SMB ourselves; this registration is discovery-only.
-            // Using a dedicated listener on the same port can fail, so advertise via
-            // NetService instead.
-            listener.cancel()
-        } catch {
-            // Fall through to NetService.
-        }
-        netService = NetService(domain: "local.", type: "_smb._tcp.", name: "iNAS", port: Int32(port))
-        netService?.includesPeerToPeer = false
-        netService?.publish()
+        let service = NetService(domain: "local.", type: "_smb._tcp.", name: Self.serviceName, port: Int32(port))
+        service.includesPeerToPeer = false
+        service.delegate = self
+        service.setTXTRecord(NetService.data(fromTXTRecord: ["path": Data("/inas".utf8)]))
+        service.publish()
+        netService = service
     }
 
     func stop() {
         netService?.stop()
+        netService?.delegate = nil
         netService = nil
-        listener?.cancel()
-        listener = nil
     }
-
-    private var netService: NetService?
 }

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Thiago Macedo
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import Foundation
 
 struct SMBEndpoint: Equatable {
@@ -17,6 +20,12 @@ struct SMBEndpoint: Equatable {
             return "\\\\\(ip)\\\(share)"
         }
         return "\\\\\(ip)@\(port)\\\(share)"
+    }
+
+    /// Name-based UNC. Windows Explorer talks SMB on 445 only.
+    var windowsNameHint: String? {
+        guard port == 445 else { return nil }
+        return "\\\\\(WindowsDiscovery.localName)\\\(share)"
     }
 }
 

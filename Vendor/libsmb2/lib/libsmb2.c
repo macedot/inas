@@ -4298,10 +4298,10 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
                 dialects[1] = SMB2_VERSION_0210;
                 break;
         case SMB2_VERSION_ANY3:
-                dialect_count = 3;
-                dialects[0] = SMB2_VERSION_0300;
-                dialects[1] = SMB2_VERSION_0302;
-                dialects[2] = SMB2_VERSION_0311;
+                /* iNAS: SMB 3.0.2+ only (no 3.0.0). Prefer 3.1.1 when offered. */
+                dialect_count = 2;
+                dialects[0] = SMB2_VERSION_0302;
+                dialects[1] = SMB2_VERSION_0311;
                 break;
         case SMB2_VERSION_0202:
         case SMB2_VERSION_0210:
@@ -4556,6 +4556,9 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
         server->session_counter = 0x1234;
 
         do {
+                if (server->fd < 0) {
+                        break;
+                }
                 /* select on the file descriptors of all active client connections and our server socket
                    for the first readable event
                 */
@@ -4679,6 +4682,9 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                         if (server->extra_service) {
                                 server->extra_service(server, &rfds, &wfds);
                         }
+                        if (server->fd < 0) {
+                                break;
+                        }
                 } else if (ready == 0) {
                         /* timeout: still drive extra FDs for timers / idle */
                         if (server->extra_service) {
@@ -4686,6 +4692,12 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                                 FD_ZERO(&wfds);
                                 server->extra_service(server, &rfds, &wfds);
                         }
+                        if (server->fd < 0) {
+                                break;
+                        }
+                } else {
+                        /* EBADF when the listen socket is shut down from another thread. */
+                        break;
                 }
 #ifdef HAVE_LIBKRB5
                 /* renew kerberos credentials daily (non-fatal on failure) */

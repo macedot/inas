@@ -1,3 +1,6 @@
+/* Copyright (C) 2026 Thiago Macedo
+ * SPDX-License-Identifier: AGPL-3.0-or-later */
+
 #include "PathSandbox.h"
 
 #include <limits.h>
@@ -21,7 +24,7 @@ is_safe_component(const char *comp, size_t len)
         }
         for (size_t i = 0; i < len; i++) {
                 unsigned char c = (unsigned char)comp[i];
-                if (c == '\0' || c == '/') {
+                if (c < 0x20 || c == 0x7F || c == '/' || c == '\\') {
                         return 0;
                 }
         }

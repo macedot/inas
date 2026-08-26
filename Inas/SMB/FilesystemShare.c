@@ -1,3 +1,6 @@
+/* Copyright (C) 2026 Thiago Macedo
+ * SPDX-License-Identifier: AGPL-3.0-or-later */
+
 #include "FilesystemShare.h"
 #include "PathSandbox.h"
 
@@ -182,9 +185,12 @@ authorize_user(struct smb2_server *srvr, struct smb2_context *smb2,
         if (ok) {
                 smb2_set_user(smb2, g.user);
                 smb2_set_password(smb2, g.password);
+        } else {
+                /* Dummy password so NTLM still runs (no username-enum shortcut). */
+                smb2_set_password(smb2, "\x01inas-reject");
         }
         pthread_mutex_unlock(&g.lock);
-        return ok ? 0 : -1;
+        return 0;
 }
 
 static int
@@ -413,6 +419,11 @@ read_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 return -1;
         }
         uint32_t len = req->length;
+        uint32_t max_read = g.server.max_read_size ? g.server.max_read_size : 0x100000;
+        if (len > max_read) {
+                pthread_mutex_unlock(&g.lock);
+                return -1;
+        }
         uint8_t *buf = malloc(len ? len : 1);
         if (!buf) {
                 pthread_mutex_unlock(&g.lock);
@@ -450,6 +461,11 @@ write_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 pthread_mutex_unlock(&g.lock);
                 return -1;
         }
+        uint32_t max_write = g.server.max_write_size ? g.server.max_write_size : 0x100000;
+        if (req->length > max_write) {
+                pthread_mutex_unlock(&g.lock);
+                return -1;
+        }
         ssize_t n = pwrite(h->fd, req->buf, req->length, (off_t)req->offset);
         pthread_mutex_unlock(&g.lock);
         if (n < 0) {
@@ -461,13 +477,15 @@ write_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         return 0;
 }
 
+#define INAS_GLOB_MAX_DEPTH 32
+#define INAS_GLOB_MAX_LEN 128
+
 static int
-match_pattern(const char *name, const char *pattern)
+match_pattern_r(const char *name, const char *pattern, int depth)
 {
-        if (!pattern || pattern[0] == '\0' || strcmp(pattern, "*") == 0 || strcmp(pattern, "*.*") == 0) {
-                return 1;
+        if (depth > INAS_GLOB_MAX_DEPTH) {
+                return 0;
         }
-        /* Very small glob: * and ? */
         const char *n = name;
         const char *p = pattern;
         while (*n && *p) {
@@ -477,7 +495,7 @@ match_pattern(const char *name, const char *pattern)
                                 return 1;
                         }
                         while (*n) {
-                                if (match_pattern(n, p)) {
+                                if (match_pattern_r(n, p, depth + 1)) {
                                         return 1;
                                 }
                                 n++;
@@ -495,6 +513,18 @@ match_pattern(const char *name, const char *pattern)
                 p++;
         }
         return *n == '\0' && *p == '\0';
+}
+
+static int
+match_pattern(const char *name, const char *pattern)
+{
+        if (!pattern || pattern[0] == '\0' || strcmp(pattern, "*") == 0 || strcmp(pattern, "*.*") == 0) {
+                return 1;
+        }
+        if (strlen(pattern) > INAS_GLOB_MAX_LEN) {
+                return 0;
+        }
+        return match_pattern_r(name, pattern, 0);
 }
 
 static int
@@ -639,14 +669,19 @@ query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
 {
         (void)srvr;
         (void)smb2;
+        char namebuf[256];
+        namebuf[0] = '\0';
         pthread_mutex_lock(&g.lock);
         struct inas_handle *h = handle_lookup(req->file_id);
         struct stat st;
         memset(&st, 0, sizeof(st));
         if (h) {
                 stat(h->path, &st);
+                const char *leaf = strrchr(h->path, '/');
+                snprintf(namebuf, sizeof(namebuf), "%s", leaf ? leaf + 1 : h->path);
         } else {
                 stat(g.root, &st);
+                snprintf(namebuf, sizeof(namebuf), "%s", g.share);
         }
         pthread_mutex_unlock(&g.lock);
 
@@ -686,19 +721,16 @@ query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         break;
                 }
                 case SMB2_FILE_ALL_INFORMATION: {
-                        struct smb2_file_all_info *p = calloc(1, sizeof(*p));
+                        size_t nlen = strlen(namebuf) + 1;
+                        struct smb2_file_all_info *p = calloc(1, sizeof(*p) + nlen);
                         if (!p) return -1;
                         fill_basic(&st, &p->basic);
                         fill_standard(&st, &p->standard);
                         p->index_number = (uint64_t)st.st_ino;
                         p->access_flags = 0x001f01ff;
-                        p->name = (const uint8_t *)(h ? strrchr(h->path, '/') : (const char *)"");
-                        if (p->name && p->name[0] == '/') {
-                                p->name++;
-                        }
-                        if (!p->name) {
-                                p->name = (const uint8_t *)"";
-                        }
+                        char *stored = (char *)(p + 1);
+                        memcpy(stored, namebuf, nlen);
+                        p->name = (const uint8_t *)stored;
                         info = p;
                         len = (int)sizeof(*p);
                         break;
@@ -749,12 +781,13 @@ query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         break;
                 }
                 case SMB2_FILE_NAME_INFORMATION: {
-                        struct smb2_file_name_info *p = calloc(1, sizeof(*p));
+                        size_t nlen = strlen(namebuf) + 1;
+                        struct smb2_file_name_info *p = calloc(1, sizeof(*p) + nlen);
                         if (!p) return -1;
-                        const char *leaf = h ? strrchr(h->path, '/') : NULL;
-                        leaf = leaf ? leaf + 1 : (h ? h->path : g.share);
-                        p->name = (const uint8_t *)leaf;
-                        p->file_name_length = (uint32_t)(strlen(leaf) * 2);
+                        char *stored = (char *)(p + 1);
+                        memcpy(stored, namebuf, nlen);
+                        p->name = (const uint8_t *)stored;
+                        p->file_name_length = (uint32_t)(strlen(namebuf) * 2);
                         info = p;
                         len = (int)sizeof(*p);
                         break;
@@ -908,11 +941,8 @@ ioctl_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         memset(rep, 0, sizeof(*rep));
         rep->ctl_code = req->ctl_code;
         memcpy(rep->file_id, req->file_id, SMB2_FD_SIZE);
-        if (req->ctl_code == SMB2_FSCTL_VALIDATE_NEGOTIATE_INFO) {
-                return 0;
-        }
-        /* Unknown FSCTL: not fatal for common clients. */
-        return 0;
+        /* Do not ACK security FSCTLs we do not implement (e.g. validate-negotiate). */
+        return -1;
 }
 
 static int
@@ -972,6 +1002,10 @@ on_new_client(struct smb2_context *smb2, void *cb_data)
         smb2_set_authentication(smb2, SMB2_SEC_NTLMSSP);
         smb2_set_seal(smb2, 1);
         smb2_set_sign(smb2, 1);
+        smb2_set_security_mode(
+                smb2,
+                SMB2_NEGOTIATE_SIGNING_ENABLED | SMB2_NEGOTIATE_SIGNING_REQUIRED
+        );
 }
 
 static void *
@@ -1032,8 +1066,18 @@ inas_smb_start(const inas_smb_config *config)
         }
         snprintf(g.share, sizeof(g.share), "%s",
                  config->share_name && config->share_name[0] ? config->share_name : INAS_SHARE_DEFAULT);
-        snprintf(g.user, sizeof(g.user), "%s", config->username);
-        snprintf(g.password, sizeof(g.password), "%s", config->password);
+        memset(g.user, 0, sizeof(g.user));
+        memset(g.password, 0, sizeof(g.password));
+        if (!config->username[0] || !config->password[0]) {
+                pthread_mutex_unlock(&g.lock);
+                return -EINVAL;
+        }
+        if (snprintf(g.user, sizeof(g.user), "%s", config->username) >= (int)sizeof(g.user) ||
+            snprintf(g.password, sizeof(g.password), "%s", config->password) >= (int)sizeof(g.password)) {
+                memset(g.password, 0, sizeof(g.password));
+                pthread_mutex_unlock(&g.lock);
+                return -ENAMETOOLONG;
+        }
         if (config->hostname && config->hostname[0]) {
                 snprintf(g.hostname, sizeof(g.hostname), "%s", config->hostname);
         } else {
@@ -1088,13 +1132,13 @@ inas_smb_stop(void)
 {
         pthread_mutex_lock(&g.lock);
         g.running = 0;
-        if (g.server.fd >= 0) {
-                shutdown(g.server.fd, SHUT_RDWR);
-                close(g.server.fd);
-                g.server.fd = -1;
-        }
+        int fd = g.server.fd;
         int started = g.thread_started;
         pthread_mutex_unlock(&g.lock);
+        /* Wake select(); the server thread closes the fd and exits the loop. */
+        if (fd >= 0) {
+                shutdown(fd, SHUT_RDWR);
+        }
         if (started) {
                 pthread_join(g.thread, NULL);
                 g.thread_started = 0;

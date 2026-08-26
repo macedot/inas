@@ -1,3 +1,6 @@
+/* Copyright (C) 2026 Thiago Macedo
+ * SPDX-License-Identifier: AGPL-3.0-or-later */
+
 #include <smb2/libsmb2.h>
 #include <smb2/libsmb2-share-enum.h>
 

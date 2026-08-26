@@ -1,3 +1,6 @@
+/* Copyright (C) 2026 Thiago Macedo
+ * SPDX-License-Identifier: AGPL-3.0-or-later */
+
 /* iOS/iPadOS libsmb2 config: NTLMSSP only, no Kerberos/GSSAPI, no SMBv1 extras. */
 
 #define CONFIGURE_OPTION_TCP_LINGER 1

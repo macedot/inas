@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Thiago Macedo
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import SwiftUI
 import UIKit
 
@@ -54,7 +57,13 @@ struct ShareScreen: View {
 
     private var sessionCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            sessionRow(label: "Address", value: controller.connectionURL, copy: controller.connectionURL)
+            sessionRow(label: "Mac", value: controller.connectionURL, copy: controller.connectionURL)
+            if let windows = controller.endpoint?.windowsHint {
+                sessionRow(label: "Windows", value: windows, copy: windows)
+            }
+            if let name = controller.endpoint?.windowsNameHint {
+                sessionRow(label: "Windows name", value: name, copy: name)
+            }
             sessionRow(label: "User", value: controller.credentials.username, copy: controller.credentials.username)
             sessionRow(label: "Password", value: controller.credentials.password, copy: controller.credentials.password)
         }
