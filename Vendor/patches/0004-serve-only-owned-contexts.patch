@@ -1,0 +1,63 @@
+diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Vendor/libsmb2/lib/libsmb2.c
+index e9ecf73..b40af5d 100644
+--- a/Vendor/libsmb2/lib/libsmb2.c
++++ b/Vendor/libsmb2/lib/libsmb2.c
+@@ -4577,6 +4577,9 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
+                 maxfd = server->fd;
+ 
+                 for (smb2 = smb2_active_contexts(); smb2; smb2 = smb2->next) {
++                        if (smb2->owning_server != server) {
++                                continue;
++                        }
+                         if (SMB2_VALID_SOCKET(smb2_get_fd(smb2))) {
+                                 events = smb2_which_events(smb2);
+                                 if (events) {
+@@ -4614,6 +4617,9 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
+ 
+                         /* for each client context ready to read, process that context */
+                         for (smb2 = smb2_active_contexts(); smb2; smb2 = smb2->next) {
++                                if (smb2->owning_server != server) {
++                                        continue;
++                                }
+                                 if (SMB2_VALID_SOCKET(smb2_get_fd(smb2)) && FD_ISSET(smb2_get_fd(smb2), &rfds)) {
+                                         if (smb2_service(smb2, POLLIN) < 0) {
+                                                 smb2_set_error(smb2, "smb2_service (in) failed with : "
+@@ -4676,7 +4682,7 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
+                          * do only one per iteration since active list changes on destroy
+                          */
+                         for (smb2 = smb2_active_contexts(); smb2; smb2 = smb2->next) {
+-                                if (smb2_is_server(smb2)) {
++                                if (smb2->owning_server == server) {
+                                         if (!SMB2_VALID_SOCKET(smb2_get_fd(smb2))) {
+                                                 if (server->handlers && server->handlers->destruction_event) {
+                                                         server->handlers->destruction_event(server, smb2);
+@@ -4685,7 +4691,6 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
+                                                 break;
+                                         }
+                                 }
+-                                /* client connections are destroyed when they timeout or get disconnected */
+                         }
+ 
+                         if (server->extra_service) {
+@@ -4734,9 +4739,18 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
+         close(server->fd);
+         server->fd = -1;
+ 
+-        while (smb2_active_contexts()) {
+-                smb2 = smb2_active_contexts();
+-                smb2_destroy_context(smb2);
++        for (;;) {
++                struct smb2_context *owned = NULL;
++                for (smb2 = smb2_active_contexts(); smb2; smb2 = smb2->next) {
++                        if (smb2->owning_server == server) {
++                                owned = smb2;
++                                break;
++                        }
++                }
++                if (!owned) {
++                        break;
++                }
++                smb2_destroy_context(owned);
+         }
+ #ifdef HAVE_LIBKRB5
+         krb5_free_server_credentials(server);

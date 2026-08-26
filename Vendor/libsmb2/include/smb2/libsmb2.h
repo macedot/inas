@@ -1496,6 +1496,7 @@ struct smb2_server_request_handlers {
                             struct smb2_query_info_reply *rep);
         int (*set_info_cmd)(struct smb2_server *srvr, struct smb2_context *smb2,
                             struct smb2_set_info_request *req);
+        int (*auth_failed)(struct smb2_server *srvr, struct smb2_context *smb2);
         /*
         int (*oplock_break cmd)(struct smb2_server *srvr, struct smb2_context *smb2,
                             struct smb2_oplock_break_request *req);
@@ -1535,9 +1536,15 @@ struct smb2_server {
                             fd_set *rfds, fd_set *wfds, int *maxfd);
         void (*extra_service)(struct smb2_server *server,
                               fd_set *rfds, fd_set *wfds);
+        void *opaque;
+        char bind_ipv4[16];
+        uint16_t allowed_dialects[8];
+        int allowed_dialect_count;
 };
 
 int smb2_bind_and_listen(const uint16_t port, const int max_connections, int *out_fd);
+int smb2_bind_and_listen_ip(const char *ipv4, const uint16_t port,
+                            const int max_connections, int *out_fd);
 int smb2_accept_connection_async(const int fd, const int to_msecs, smb2_accepted_cb cb, void *cb_data);
 int smb2_serve_port_async(const int fd, const int to_msecs, struct smb2_context **out_smb2);
 

@@ -708,6 +708,20 @@ smb2_queue_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu)
                 }
         }
 
+        /*
+         * MS-SMB2 3.2.5.2: the preauth integrity hash covers every
+         * NEGOTIATE and SESSION_SETUP message, hashed exactly once with the
+         * signature in its final form. It has to happen here: the
+         * opportunistic write in smb2_add_to_outqueue() consumes the out
+         * vectors, so callers hashing after smb2_queue_pdu() would hash
+         * zero bytes on fast links. Sealed PDUs never reach the hash: only
+         * negotiate/session setup are covered, and those are never sealed.
+         */
+        if (pdu->header.command == SMB2_NEGOTIATE ||
+            pdu->header.command == SMB2_SESSION_SETUP) {
+                smb3_update_preauth_hash(smb2, pdu->out.niov, &pdu->out.iov[0]);
+        }
+
         smb3_encrypt_pdu(smb2, pdu);
 
         smb2_add_to_outqueue(smb2, pdu);

@@ -1,0 +1,17 @@
+# libsmb2 pin
+#
+# Tree under Vendor/libsmb2 started from the libsmb2 6.1 sources
+# (configure.ac AC_INIT 6.1.0) at commit fa52e91, with iOS-side layout
+# (no DCERPC objects in the Xcode target, extra apple AES files, etc.).
+# That import is the patch baseline — not a byte-identical github tag
+# libsmb2-6.1 checkout.
+#
+# iNAS changes after the import live in Vendor/patches/ as a numbered
+# series. Scripts/vendor-check.sh applies them to the baseline and
+# requires the result to match Vendor/libsmb2.
+
+BASELINE_COMMIT=fa52e91
+UPSTREAM_NAME=libsmb2
+UPSTREAM_VERSION=6.1.0
+UPSTREAM_TAG=libsmb2-6.1
+UPSTREAM_URL=https://github.com/sahlberg/libsmb2

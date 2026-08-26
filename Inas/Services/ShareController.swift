@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Thiago Macedo
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import BackgroundTasks
 import Foundation
 import Observation
 import UIKit
@@ -25,37 +26,63 @@ final class ShareController {
         }
     }
 
-    private let store = CredentialStore()
-    private let server = SMBServer()
-    private let bonjour = BonjourAdvertiser()
-    private let windowsDiscovery = WindowsDiscovery()
-    private let background = BackgroundShareKeeper()
+    private let store: CredentialStore
+    private let shareStore: ShareStore
+    private let server: SMBServing
+    private let bonjour: BonjourAdvertising
+    private let windowsDiscovery: WindowsDiscovering
+    private let background: BackgroundShareKeeping
+    private let lan: LANAddressing
     private var statsTimer: Timer?
+    private var scopedRoots: [URL] = []
 
     var state: State = .stopped
     var credentials: ShareCredentials
+    var extras: [ExtraShare] = []
     var endpoint: SMBEndpoint?
     var showPassword = false
     var clientCount = 0
     var bytesTransferred: UInt64 = 0
 
-    init() {
+    init(
+        store: CredentialStore = CredentialStore(),
+        shareStore: ShareStore = ShareStore(),
+        server: SMBServing? = nil,
+        bonjour: BonjourAdvertising? = nil,
+        windowsDiscovery: WindowsDiscovering? = nil,
+        background: BackgroundShareKeeping? = nil,
+        lan: LANAddressing = SystemLANAddress(),
+        registerBackground: Bool = true
+    ) {
+        self.store = store
+        self.shareStore = shareStore
+        self.server = server ?? SMBServer()
+        self.bonjour = bonjour ?? BonjourAdvertiser()
+        self.windowsDiscovery = windowsDiscovery ?? WindowsDiscovery()
+        self.background = background ?? BackgroundShareKeeper()
+        self.lan = lan
         credentials = store.load()
+        extras = shareStore.load()
         seedDocumentsIfNeeded()
-        NotificationCenter.default.addObserver(
-            forName: UIApplication.didEnterBackgroundNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.handleBackground()
+        if registerBackground {
+            registerBackgroundTask()
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    self?.handleBackground()
+                }
             }
         }
     }
 
     var connectionURL: String {
-        endpoint?.smbURL ?? "smb://—/\(SMBServer.shareName)"
+        endpoint?.smbURL ?? "smb://—"
     }
+
+    var canAddShare: Bool { extras.count < ShareName.maxExtra }
 
     func toggle() {
         if state.isSharing || state == .starting {
@@ -67,7 +94,7 @@ final class ShareController {
 
     func start() {
         guard !state.isBusy else { return }
-        guard let ip = NetworkAddress.lanIPv4() else {
+        guard let ip = lan.lanIPv4() else {
             state = .failed(SMBServerError.noWiFi.localizedDescription)
             return
         }
@@ -77,18 +104,36 @@ final class ShareController {
             return
         }
         credentials.username = username
-        let password = store.passwordForStart(&credentials)
+        let password: String
+        do {
+            let session = try store.passwordForStart(credentials)
+            credentials = session.credentials
+            password = session.password
+        } catch {
+            state = .failed("Could not store the password.")
+            return
+        }
+        persistShares()
+        let live = shareStore.resolveForStart(documents: documentsURL, extras: extras)
+        scopedRoots = live.filter(\.scoped).map(\.root)
         state = .starting
 
-        let root = documentsURL
         let host = WindowsDiscovery.hostName
         let server = self.server
         Task.detached {
             do {
-                let port = try server.start(root: root, username: username, password: password, hostname: host)
+                let port = try server.start(shares: live, username: username, password: password, hostname: host, bindIP: ip)
                 await MainActor.run { [weak self] in
                     guard let self else { return }
-                    self.endpoint = SMBEndpoint(ip: ip, port: port, share: SMBServer.shareName)
+                    if self.state != .starting {
+                        server.stop()
+                        self.releaseScopedRoots()
+                        if self.state == .stopping {
+                            self.finishStop(notify: false)
+                        }
+                        return
+                    }
+                    self.endpoint = SMBEndpoint(ip: ip, port: port)
                     if !self.credentials.usesCustomPassword {
                         self.showPassword = true
                     }
@@ -102,7 +147,13 @@ final class ShareController {
                 }
             } catch {
                 await MainActor.run { [weak self] in
-                    self?.state = .failed(error.localizedDescription)
+                    guard let self else { return }
+                    self.releaseScopedRoots()
+                    if self.state == .stopping {
+                        self.finishStop(notify: false)
+                    } else {
+                        self.state = .failed(error.localizedDescription)
+                    }
                 }
             }
         }
@@ -117,16 +168,70 @@ final class ShareController {
         windowsDiscovery.stop()
         background.sharingDidStop()
         let server = self.server
+        let notifyStopped = notify
         Task.detached {
             server.stop()
             await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.state = .stopped
-                if notify {
-                    self.background.notifyStoppedBySystem()
-                }
+                self?.finishStop(notify: notifyStopped)
             }
         }
+    }
+
+    private func finishStop(notify: Bool) {
+        releaseScopedRoots()
+        if !credentials.usesCustomPassword {
+            credentials.password = ""
+            showPassword = false
+        }
+        endpoint = nil
+        state = .stopped
+        if notify {
+            background.notifyStoppedBySystem()
+        }
+    }
+
+    func persistShares() {
+        shareStore.save(extras)
+    }
+
+    func addShare() {
+        guard canAddShare, !state.isSharing else { return }
+        extras.append(ExtraShare(id: UUID(), name: "", folderTitle: "", bookmark: nil))
+    }
+
+    func removeShare(id: UUID) {
+        guard !state.isSharing else { return }
+        extras.removeAll { $0.id == id }
+        persistShares()
+    }
+
+    func setShareName(_ name: String, id: UUID) {
+        guard let index = extras.firstIndex(where: { $0.id == id }) else { return }
+        extras[index].name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        persistShares()
+    }
+
+    func setShareFolder(_ url: URL, id: UUID) {
+        guard let index = extras.firstIndex(where: { $0.id == id }),
+              let (bookmark, title) = ShareStore.bookmark(for: url) else { return }
+        extras[index].bookmark = bookmark
+        extras[index].folderTitle = title
+        persistShares()
+    }
+
+    func passwordDidChange() {
+        if !credentials.password.isEmpty {
+            credentials.usesCustomPassword = true
+        }
+        persistCredentials()
+    }
+
+    func setGeneratesPasswordEachStart(_ enabled: Bool) {
+        credentials.usesCustomPassword = !enabled
+        if enabled {
+            credentials.password = ""
+        }
+        persistCredentials()
     }
 
     func persistCredentials() {
@@ -135,7 +240,14 @@ final class ShareController {
         if credentials.usesCustomPassword {
             credentials.password = credentials.password.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        store.save(credentials)
+        do {
+            try store.save(credentials)
+        } catch {
+            if !state.isSharing {
+                state = .failed("Could not store the password.")
+            }
+            return
+        }
         if !credentials.usesCustomPassword && !state.isSharing {
             credentials.password = ""
         }
@@ -154,10 +266,42 @@ final class ShareController {
         statsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
+                if let expected = self.endpoint?.ip, self.lan.lanIPv4() != expected {
+                    self.stop(notify: true)
+                    return
+                }
                 self.clientCount = self.server.clientCount
                 self.bytesTransferred = self.server.bytesTransferred
             }
         }
+    }
+
+    private func registerBackgroundTask() {
+        if #available(iOS 26.0, *) {
+            BGTaskScheduler.shared.register(
+                forTaskWithIdentifier: BackgroundShareKeeper.taskIdentifier,
+                using: nil
+            ) { [weak self] task in
+                guard let continued = task as? BGContinuedProcessingTask else {
+                    task.setTaskCompleted(success: false)
+                    return
+                }
+                continued.expirationHandler = {
+                    Task { @MainActor in
+                        self?.stop(notify: true)
+                    }
+                    continued.setTaskCompleted(success: false)
+                }
+                continued.updateTitle("Sharing files", subtitle: "SMB 3 · iNAS")
+            }
+        }
+    }
+
+    private func releaseScopedRoots() {
+        for url in scopedRoots {
+            url.stopAccessingSecurityScopedResource()
+        }
+        scopedRoots = []
     }
 
     private var documentsURL: URL {

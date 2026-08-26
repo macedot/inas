@@ -1,47 +1,78 @@
 // Copyright (C) 2026 Thiago Macedo
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import Darwin
 import Foundation
 import Network
 
 /// Windows name resolution and Network-neighborhood discovery.
 ///
 /// Macs find the share via Bonjour `_smb._tcp` (see `BonjourAdvertiser`).
-/// Windows Explorer uses WS-Discovery, then LLMNR / mDNS, then SMB on 445.
-///
-/// Custom multicast (WSD + LLMNR) may be denied on iOS without Apple's
-/// multicast entitlement. Bind/join failures are ignored so SMB still works.
-/// The `iNAS.local` A record uses the system mDNSResponder (allowed).
-final class WindowsDiscovery {
+/// Windows Explorer lists computers with WS-Discovery (UDP 3702), then
+/// fetches metadata over HTTP 5357, then connects to SMB on 445.
+final class WindowsDiscovery: WindowsDiscovering {
     static let hostName = "iNAS"
     static let localName = "iNAS.local"
     private static let metadataPort: UInt16 = 5357
+    private static let wsdPort: UInt16 = 3702
+    private static let wsdGroup = "239.255.255.250"
+    private static let llmnrPort: UInt16 = 5355
+    private static let llmnrGroup = "224.0.0.252"
+    private static let anonymousTo = "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous"
 
     private let queue = DispatchQueue(label: "app.inas.discovery")
-    private var generation = 0
-    private var wsdGroup: NWConnectionGroup?
-    private var llmnrGroup: NWConnectionGroup?
-    private var metadataListener: NWListener?
-    private var mdnsService: DNSServiceRef?
-    private var instanceId = "1"
-    private var messageNumber: UInt32 = 0
-    private var endpointUUID = UUID()
-    private var advertisedIP = ""
-    private var advertisedPort: UInt16 = 445
+    private var session: Session?
+
+    private final class Session {
+        let advertisedIP: String
+        let advertisedPort: UInt16
+        let instanceId: String
+        let endpointUUID: UUID
+        var messageNumber: UInt32 = 0
+        var wsdFD: Int32 = -1
+        var llmnrFD: Int32 = -1
+        var wsdSource: DispatchSourceRead?
+        var llmnrSource: DispatchSourceRead?
+        var helloTimer: DispatchSourceTimer?
+        var metadataListener: NWListener?
+        var mdnsService: DNSServiceRef?
+
+        init(ip: String, port: UInt16) {
+            advertisedIP = ip
+            advertisedPort = port
+            instanceId = String(Int(Date().timeIntervalSince1970))
+            endpointUUID = UUID()
+        }
+
+        func invalidate() {
+            helloTimer?.cancel()
+            helloTimer = nil
+            wsdSource?.cancel()
+            wsdSource = nil
+            llmnrSource?.cancel()
+            llmnrSource = nil
+            wsdFD = -1
+            llmnrFD = -1
+            metadataListener?.cancel()
+            metadataListener = nil
+            if let mdnsService {
+                DNSServiceRefDeallocate(mdnsService)
+            }
+            mdnsService = nil
+        }
+    }
 
     func start(ip: String, port: UInt16) {
         queue.async { [self] in
             stopLocked()
-            generation += 1
-            advertisedIP = ip
-            advertisedPort = port
-            instanceId = String(Int(Date().timeIntervalSince1970))
-            messageNumber = 0
-            endpointUUID = UUID()
-            startMDNSHostname()
-            startWSD()
-            startLLMNR()
-            startMetadataHTTP()
+            let next = Session(ip: ip, port: port)
+            session = next
+            startMDNSHostname(next)
+            startWSD(next)
+            startLLMNR(next)
+            startMetadataHTTP(next)
+            sendHelloBurst(next)
+            startHelloTimer(next)
         }
     }
 
@@ -52,24 +83,20 @@ final class WindowsDiscovery {
     }
 
     private func stopLocked() {
-        generation += 1
-        sendWSDBye()
-        wsdGroup?.cancel()
-        wsdGroup = nil
-        llmnrGroup?.cancel()
-        llmnrGroup = nil
-        metadataListener?.cancel()
-        metadataListener = nil
-        if let mdnsService {
-            DNSServiceRefDeallocate(mdnsService)
-        }
-        mdnsService = nil
+        guard let current = session else { return }
+        sendWSDMulticast(wsdHelloOrBye(action: "Bye", session: current), session: current)
+        current.invalidate()
+        session = nil
+    }
+
+    private func isCurrent(_ s: Session) -> Bool {
+        session === s
     }
 
     // MARK: - mDNS A record (`iNAS.local`)
 
-    private func startMDNSHostname() {
-        let parts = Self.ipv4Bytes(advertisedIP)
+    private func startMDNSHostname(_ session: Session) {
+        let parts = Self.ipv4Bytes(session.advertisedIP)
         guard parts.count == 4 else { return }
 
         var sdRef: DNSServiceRef?
@@ -104,93 +131,144 @@ final class WindowsDiscovery {
             DNSServiceRefDeallocate(connected)
             return
         }
-        mdnsService = connected
+        session.mdnsService = connected
     }
 
-    // MARK: - WS-Discovery (UDP 3702 / 239.255.255.250)
+    // MARK: - WS-Discovery (UDP 3702)
 
-    private func startWSD() {
-        do {
-            let multicast = try NWMulticastGroup(for: [
-                .hostPort(host: NWEndpoint.Host("239.255.255.250"), port: 3702)
-            ])
-            let group = NWConnectionGroup(with: multicast, using: udpLinkLocalParameters())
-            let gen = generation
-            group.setReceiveHandler(maximumMessageSize: 64 * 1024, rejectOversizedMessages: true) { [weak self] message, content, _ in
-                guard let self, self.generation == gen, let content else { return }
-                self.handleWSD(content, reply: message)
+    private func startWSD(_ session: Session) {
+        let fd = session.advertisedIP.withCString { ipPtr in
+            Self.wsdGroup.withCString { grpPtr in
+                inas_udp_open(ipPtr, Self.wsdPort, grpPtr, 1)
             }
-            group.stateUpdateHandler = { [weak self] state in
-                guard let self, self.generation == gen else { return }
-                if case .ready = state {
-                    self.sendWSDHello()
-                }
-                if case .failed = state {
-                    group.cancel()
-                    if self.wsdGroup === group {
-                        self.wsdGroup = nil
-                    }
-                }
+        }
+        guard fd >= 0 else { return }
+        session.wsdFD = fd
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in
+            guard let self, self.isCurrent(session) else { return }
+            self.drainWSD(session, fd: fd)
+        }
+        source.setCancelHandler {
+            inas_udp_close(fd)
+            session.wsdFD = -1
+        }
+        source.resume()
+        session.wsdSource = source
+    }
+
+    private func drainWSD(_ session: Session, fd: Int32) {
+        guard isCurrent(session) else { return }
+        var buf = [UInt8](repeating: 0, count: 32 * 1024)
+        var srcIP = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        var srcPort: UInt16 = 0
+        while true {
+            let n = buf.withUnsafeMutableBytes { raw -> Int32 in
+                guard let base = raw.baseAddress else { return 0 }
+                return inas_udp_recvfrom(fd, base, Int32(raw.count), &srcIP, Int32(srcIP.count), &srcPort)
             }
-            group.start(queue: queue)
-            wsdGroup = group
-        } catch {
-            // Soft-fail: no multicast entitlement / join denied.
+            if n <= 0 { break }
+            let data = Data(buf.prefix(Int(n)))
+            let ip = String(cString: srcIP)
+            handleWSD(data, from: ip, port: srcPort, session: session)
         }
     }
 
-    private func handleWSD(_ data: Data, reply message: NWConnectionGroup.Message) {
-        guard let xml = String(data: data, encoding: .utf8) else { return }
-        let isProbe = xml.contains("Probe") && xml.contains("http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe")
-        guard isProbe else { return }
-        let relates = uuidFromXML(xml, tag: "MessageID") ?? "urn:uuid:\(UUID().uuidString)"
-        guard let body = wsdProbeMatch(relatesTo: relates).data(using: .utf8) else { return }
-        message.reply(content: body)
+    private func handleWSD(_ data: Data, from ip: String, port: UInt16, session: Session) {
+        guard isCurrent(session), let xml = String(data: data, encoding: .utf8) else { return }
+        let action = Self.wsdAction(xml)
+        if action.hasSuffix("/Probe") && !action.hasSuffix("/ProbeMatches") {
+            let relates = Self.uuidFromXML(xml, tag: "MessageID") ?? "urn:uuid:\(UUID().uuidString.lowercased())"
+            sendWSDUnicast(wsdProbeMatch(relatesTo: relates, session: session), to: ip, port: port, session: session)
+            return
+        }
+        if action.hasSuffix("/Resolve") && !action.hasSuffix("/ResolveMatches") {
+            let relates = Self.uuidFromXML(xml, tag: "MessageID") ?? "urn:uuid:\(UUID().uuidString.lowercased())"
+            sendWSDUnicast(wsdResolveMatch(relatesTo: relates, session: session), to: ip, port: port, session: session)
+        }
     }
 
-    private func sendWSDHello() {
-        sendWSD(wsdHelloOrBye(action: "Hello"))
+    private func sendHelloBurst(_ session: Session) {
+        let xml = wsdHelloOrBye(action: "Hello", session: session)
+        sendWSDMulticast(xml, session: session)
+        let delays: [Double] = [0.08, 0.2, 0.45]
+        for delay in delays {
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.isCurrent(session) else { return }
+                self.sendWSDMulticast(xml, session: session)
+            }
+        }
     }
 
-    private func sendWSDBye() {
-        sendWSD(wsdHelloOrBye(action: "Bye"))
+    private func startHelloTimer(_ session: Session) {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 15, repeating: 20)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.isCurrent(session) else { return }
+            self.sendWSDMulticast(self.wsdHelloOrBye(action: "Hello", session: session), session: session)
+        }
+        timer.resume()
+        session.helloTimer = timer
     }
 
-    private func sendWSD(_ xml: String) {
-        guard let group = wsdGroup, let data = xml.data(using: .utf8) else { return }
-        group.send(content: data, to: nil, message: .default) { _ in }
+    private func sendWSDMulticast(_ xml: String, session: Session) {
+        sendWSDUnicast(xml, to: Self.wsdGroup, port: Self.wsdPort, session: session)
+        if let bcast = Self.subnetBroadcast(for: session.advertisedIP) {
+            sendWSDUnicast(xml, to: bcast, port: Self.wsdPort, session: session)
+        }
     }
 
-    private func nextMessageNumber() -> UInt32 {
-        messageNumber += 1
-        return messageNumber
+    private func sendWSDUnicast(_ xml: String, to ip: String, port: UInt16, session: Session) {
+        guard session.wsdFD >= 0, let data = xml.data(using: .utf8) else { return }
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            ip.withCString { ipPtr in
+                _ = inas_udp_sendto(session.wsdFD, ipPtr, port, base, Int32(data.count))
+            }
+        }
     }
 
-    private var xaddrs: String {
-        "http://\(advertisedIP):\(Self.metadataPort)/\(endpointUUID.uuidString.lowercased())"
+    private func nextMessageNumber(_ session: Session) -> UInt32 {
+        session.messageNumber += 1
+        return session.messageNumber
     }
 
-    private func wsdHelloOrBye(action: String) -> String {
+    private func xaddrs(_ session: Session) -> String {
+        "http://\(session.advertisedIP):\(Self.metadataPort)/\(session.endpointUUID.uuidString.lowercased())"
+    }
+
+    private var computerName: String {
+        "\(Self.hostName.uppercased())/Workgroup:WORKGROUP"
+    }
+
+    static func xmlEscaped(_ value: String) -> String {
+        WSDMessageBuilder.xmlEscaped(value)
+    }
+
+    static func wsdAction(_ xml: String) -> String {
+        WSDMessageBuilder.soapAction(xml)
+    }
+
+    private func wsdHelloOrBye(action: String, session: Session) -> String {
         let msgID = "urn:uuid:\(UUID().uuidString.lowercased())"
-        let n = nextMessageNumber()
+        let n = nextMessageNumber(session)
         let types = action == "Bye" ? "" : """
         <wsd:Types>wsdp:Device pub:Computer</wsd:Types>
-        <wsd:Scopes>wsd.microsoft.com/windows</wsd:Scopes>
-        <wsd:XAddrs>\(xaddrs)</wsd:XAddrs>
+        <wsd:XAddrs>\(xaddrs(session))</wsd:XAddrs>
         <wsd:MetadataVersion>1</wsd:MetadataVersion>
         """
         return """
         <?xml version="1.0" encoding="utf-8"?>
-        <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof" xmlns:pub="http://schemas.microsoft.com/windows/pub/2005/07">
+        <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof" xmlns:pub="http://schemas.microsoft.com/windows/pub/2005/07" xmlns:pnpx="http://schemas.microsoft.com/windows/pnpx/2005/10">
           <soap:Header>
             <wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>
             <wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/\(action)</wsa:Action>
             <wsa:MessageID>\(msgID)</wsa:MessageID>
-            <wsd:AppSequence InstanceId="\(instanceId)" MessageNumber="\(n)"/>
+            <wsd:AppSequence InstanceId="\(session.instanceId)" SequenceId="urn:uuid:\(session.endpointUUID.uuidString.lowercased())" MessageNumber="\(n)"/>
           </soap:Header>
           <soap:Body>
             <wsd:\(action)>
-              <wsa:EndpointReference><wsa:Address>urn:uuid:\(endpointUUID.uuidString.lowercased())</wsa:Address></wsa:EndpointReference>
+              <wsa:EndpointReference><wsa:Address>urn:uuid:\(session.endpointUUID.uuidString.lowercased())</wsa:Address></wsa:EndpointReference>
               \(types)
             </wsd:\(action)>
           </soap:Body>
@@ -198,47 +276,55 @@ final class WindowsDiscovery {
         """
     }
 
-    private func wsdProbeMatch(relatesTo: String) -> String {
+    private func wsdProbeMatch(relatesTo: String, session: Session) -> String {
+        wsdMatch(kind: "Probe", relatesTo: relatesTo, includeXAddrs: true, session: session)
+    }
+
+    private func wsdResolveMatch(relatesTo: String, session: Session) -> String {
+        wsdMatch(kind: "Resolve", relatesTo: relatesTo, includeXAddrs: true, session: session)
+    }
+
+    private func wsdMatch(kind: String, relatesTo: String, includeXAddrs: Bool, session: Session) -> String {
         let msgID = "urn:uuid:\(UUID().uuidString.lowercased())"
-        let n = nextMessageNumber()
-        let uuid = endpointUUID.uuidString.lowercased()
+        let n = nextMessageNumber(session)
+        let uuid = session.endpointUUID.uuidString.lowercased()
+        let xaddr = includeXAddrs ? "<wsd:XAddrs>\(xaddrs(session))</wsd:XAddrs>" : ""
         return """
         <?xml version="1.0" encoding="utf-8"?>
-        <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof" xmlns:pub="http://schemas.microsoft.com/windows/pub/2005/07">
+        <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof" xmlns:pub="http://schemas.microsoft.com/windows/pub/2005/07" xmlns:pnpx="http://schemas.microsoft.com/windows/pnpx/2005/10">
           <soap:Header>
-            <wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>
-            <wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches</wsa:Action>
+            <wsa:To>\(Self.anonymousTo)</wsa:To>
+            <wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/\(kind)Matches</wsa:Action>
             <wsa:MessageID>\(msgID)</wsa:MessageID>
-            <wsa:RelatesTo>\(relatesTo)</wsa:RelatesTo>
-            <wsd:AppSequence InstanceId="\(instanceId)" MessageNumber="\(n)"/>
+            <wsa:RelatesTo>\(Self.xmlEscaped(relatesTo))</wsa:RelatesTo>
+            <wsd:AppSequence InstanceId="\(session.instanceId)" SequenceId="urn:uuid:\(uuid)" MessageNumber="\(n)"/>
           </soap:Header>
           <soap:Body>
-            <wsd:ProbeMatches>
-              <wsd:ProbeMatch>
+            <wsd:\(kind)Matches>
+              <wsd:\(kind)Match>
                 <wsa:EndpointReference><wsa:Address>urn:uuid:\(uuid)</wsa:Address></wsa:EndpointReference>
                 <wsd:Types>wsdp:Device pub:Computer</wsd:Types>
-                <wsd:Scopes>wsd.microsoft.com/windows</wsd:Scopes>
-                <wsd:XAddrs>\(xaddrs)</wsd:XAddrs>
+                \(xaddr)
                 <wsd:MetadataVersion>1</wsd:MetadataVersion>
-              </wsd:ProbeMatch>
-            </wsd:ProbeMatches>
+              </wsd:\(kind)Match>
+            </wsd:\(kind)Matches>
           </soap:Body>
         </soap:Envelope>
         """
     }
 
-    private func wsdGetResponse(relatesTo: String) -> String {
+    private func wsdGetResponse(relatesTo: String, session: Session) -> String {
         let msgID = "urn:uuid:\(UUID().uuidString.lowercased())"
-        let uuid = endpointUUID.uuidString.lowercased()
+        let uuid = session.endpointUUID.uuidString.lowercased()
         let name = Self.hostName
         return """
         <?xml version="1.0" encoding="utf-8"?>
-        <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof" xmlns:wsx="http://schemas.xmlsoap.org/ws/2004/09/mex" xmlns:pub="http://schemas.microsoft.com/windows/pub/2005/07">
+        <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof" xmlns:wsx="http://schemas.xmlsoap.org/ws/2004/09/mex" xmlns:pub="http://schemas.microsoft.com/windows/pub/2005/07" xmlns:pnpx="http://schemas.microsoft.com/windows/pnpx/2005/10">
           <soap:Header>
-            <wsa:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:To>
+            <wsa:To>\(Self.anonymousTo)</wsa:To>
             <wsa:Action>http://schemas.xmlsoap.org/ws/2004/09/transfer/GetResponse</wsa:Action>
             <wsa:MessageID>\(msgID)</wsa:MessageID>
-            <wsa:RelatesTo>\(relatesTo)</wsa:RelatesTo>
+            <wsa:RelatesTo>\(Self.xmlEscaped(relatesTo))</wsa:RelatesTo>
           </soap:Header>
           <soap:Body>
             <wsx:Metadata>
@@ -254,6 +340,7 @@ final class WindowsDiscovery {
                   <wsdp:Manufacturer>iNAS</wsdp:Manufacturer>
                   <wsdp:ModelName>iNAS</wsdp:ModelName>
                   <wsdp:ModelNumber>1</wsdp:ModelNumber>
+                  <pnpx:DeviceCategory>Computers</pnpx:DeviceCategory>
                 </wsdp:ThisModel>
               </wsx:MetadataSection>
               <wsx:MetadataSection Dialect="http://schemas.xmlsoap.org/ws/2006/02/devprof/Relationship">
@@ -262,7 +349,7 @@ final class WindowsDiscovery {
                     <wsa:EndpointReference><wsa:Address>urn:uuid:\(uuid)</wsa:Address></wsa:EndpointReference>
                     <wsdp:Types>pub:Computer</wsdp:Types>
                     <wsdp:ServiceId>urn:uuid:\(uuid)</wsdp:ServiceId>
-                    <pub:Computer>\(name)/Workgroup:WORKGROUP</pub:Computer>
+                    <pub:Computer>\(computerName)</pub:Computer>
                   </wsdp:Host>
                 </wsdp:Relationship>
               </wsx:MetadataSection>
@@ -272,54 +359,55 @@ final class WindowsDiscovery {
         """
     }
 
-    private func uuidFromXML(_ xml: String, tag: String) -> String? {
-        guard let start = xml.range(of: "<wsa:\(tag)>") ?? xml.range(of: "<\(tag)>") else { return nil }
-        let rest = xml[start.upperBound...]
-        guard let end = rest.range(of: "</") else { return nil }
-        let value = rest[..<end.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? nil : String(value)
+    static func uuidFromXML(_ xml: String, tag: String) -> String? {
+        WSDMessageBuilder.uuidFromXML(xml, tag: tag)
     }
 
     // MARK: - WSD metadata HTTP (TCP 5357)
 
-    private func startMetadataHTTP() {
+    private func startMetadataHTTP(_ session: Session) {
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
             params.includePeerToPeer = false
+            if let addr = IPv4Address(session.advertisedIP) {
+                params.requiredLocalEndpoint = .hostPort(
+                    host: .ipv4(addr),
+                    port: NWEndpoint.Port(rawValue: Self.metadataPort)!
+                )
+            }
             let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Self.metadataPort)!)
-            let gen = generation
             listener.newConnectionHandler = { [weak self] connection in
-                guard let self, self.generation == gen else {
+                guard let self, self.isCurrent(session) else {
                     connection.cancel()
                     return
                 }
-                self.handleMetadataConnection(connection)
+                self.handleMetadataConnection(connection, session: session)
             }
             listener.stateUpdateHandler = { [weak self] state in
-                guard let self, self.generation == gen else { return }
+                guard let self, self.isCurrent(session) else { return }
                 if case .failed = state {
                     listener.cancel()
-                    if self.metadataListener === listener {
-                        self.metadataListener = nil
+                    if session.metadataListener === listener {
+                        session.metadataListener = nil
                     }
                 }
             }
             listener.start(queue: queue)
-            metadataListener = listener
+            session.metadataListener = listener
         } catch {
             // Soft-fail.
         }
     }
 
-    private func handleMetadataConnection(_ connection: NWConnection) {
+    private func handleMetadataConnection(_ connection: NWConnection, session: Session) {
         connection.start(queue: queue)
-        receiveHTTP(connection, accumulated: Data())
+        receiveHTTP(connection, accumulated: Data(), session: session)
     }
 
-    private func receiveHTTP(_ connection: NWConnection, accumulated: Data) {
+    private func receiveHTTP(_ connection: NWConnection, accumulated: Data, session: Session) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] content, _, isComplete, error in
-            guard let self else {
+            guard let self, self.isCurrent(session) else {
                 connection.cancel()
                 return
             }
@@ -331,22 +419,26 @@ final class WindowsDiscovery {
             if let content {
                 buffer.append(content)
             }
-            if let request = String(data: buffer, encoding: .utf8),
-               request.contains("\r\n\r\n") {
-                let relates = self.uuidFromXML(request, tag: "MessageID") ?? "urn:uuid:\(UUID().uuidString.lowercased())"
-                self.sendMetadataResponse(on: connection, relatesTo: relates)
+            if Self.httpRequestComplete(buffer) {
+                let request = String(data: buffer, encoding: .utf8) ?? ""
+                let relates = Self.uuidFromXML(request, tag: "MessageID") ?? "urn:uuid:\(UUID().uuidString.lowercased())"
+                self.sendMetadataResponse(on: connection, relatesTo: relates, session: session)
                 return
             }
             if isComplete || buffer.count > 64 * 1024 {
                 connection.cancel()
                 return
             }
-            self.receiveHTTP(connection, accumulated: buffer)
+            self.receiveHTTP(connection, accumulated: buffer, session: session)
         }
     }
 
-    private func sendMetadataResponse(on connection: NWConnection, relatesTo: String) {
-        let xml = wsdGetResponse(relatesTo: relatesTo)
+    static func httpRequestComplete(_ data: Data) -> Bool {
+        WSDMessageBuilder.httpRequestComplete(data)
+    }
+
+    private func sendMetadataResponse(on connection: NWConnection, relatesTo: String, session: Session) {
+        let xml = wsdGetResponse(relatesTo: relatesTo, session: session)
         let body = Data(xml.utf8)
         var header = "HTTP/1.1 200 OK\r\n"
         header += "Content-Type: application/soap+xml; charset=utf-8\r\n"
@@ -359,34 +451,48 @@ final class WindowsDiscovery {
         })
     }
 
-    // MARK: - LLMNR (UDP 5355 / 224.0.0.252)
+    // MARK: - LLMNR (UDP 5355)
 
-    private func startLLMNR() {
-        do {
-            let multicast = try NWMulticastGroup(for: [
-                .hostPort(host: NWEndpoint.Host("224.0.0.252"), port: 5355)
-            ])
-            let group = NWConnectionGroup(with: multicast, using: udpLinkLocalParameters())
-            let gen = generation
-            group.setReceiveHandler(maximumMessageSize: 4096, rejectOversizedMessages: true) { [weak self] message, content, _ in
-                guard let self, self.generation == gen, let content else { return }
-                if let reply = Self.llmnrReply(for: content, hostName: Self.hostName, ipv4: self.advertisedIP) {
-                    message.reply(content: reply)
+    private func startLLMNR(_ session: Session) {
+        let fd = session.advertisedIP.withCString { ipPtr in
+            Self.llmnrGroup.withCString { grpPtr in
+                inas_udp_open(ipPtr, Self.llmnrPort, grpPtr, 1)
+            }
+        }
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in
+            guard let self, self.isCurrent(session) else { return }
+            self.drainLLMNR(session, fd: fd)
+        }
+        source.setCancelHandler {
+            inas_udp_close(fd)
+        }
+        source.resume()
+        session.llmnrSource = source
+        session.llmnrFD = fd
+    }
+
+    private func drainLLMNR(_ session: Session, fd: Int32) {
+        guard isCurrent(session) else { return }
+        var buf = [UInt8](repeating: 0, count: 4096)
+        var srcIP = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        var srcPort: UInt16 = 0
+        while true {
+            let n = buf.withUnsafeMutableBytes { raw -> Int32 in
+                guard let base = raw.baseAddress else { return 0 }
+                return inas_udp_recvfrom(fd, base, Int32(raw.count), &srcIP, Int32(srcIP.count), &srcPort)
+            }
+            if n <= 0 { break }
+            let query = Data(buf.prefix(Int(n)))
+            guard let reply = Self.llmnrReply(for: query, hostName: Self.hostName, ipv4: session.advertisedIP) else { continue }
+            let ip = String(cString: srcIP)
+            reply.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                ip.withCString { ipPtr in
+                    _ = inas_udp_sendto(fd, ipPtr, srcPort, base, Int32(reply.count))
                 }
             }
-            group.stateUpdateHandler = { [weak self] state in
-                guard let self, self.generation == gen else { return }
-                if case .failed = state {
-                    group.cancel()
-                    if self.llmnrGroup === group {
-                        self.llmnrGroup = nil
-                    }
-                }
-            }
-            group.start(queue: queue)
-            llmnrGroup = group
-        } catch {
-            // Soft-fail.
         }
     }
 
@@ -436,19 +542,14 @@ final class WindowsDiscovery {
 
     // MARK: - Helpers
 
-    private func udpLinkLocalParameters() -> NWParameters {
-        let params = NWParameters.udp
-        params.allowLocalEndpointReuse = true
-        params.includePeerToPeer = false
-        if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
-            ip.version = .v4
-            ip.hopLimit = 1
-        }
-        return params
-    }
-
     private static func ipv4Bytes(_ ip: String) -> [UInt8] {
         let parts = ip.split(separator: ".").compactMap { UInt8($0) }
         return parts.count == 4 ? parts : []
+    }
+
+    static func subnetBroadcast(for ip: String) -> String? {
+        let parts = ipv4Bytes(ip)
+        guard parts.count == 4 else { return nil }
+        return "\(parts[0]).\(parts[1]).\(parts[2]).255"
     }
 }

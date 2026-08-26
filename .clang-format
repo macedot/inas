@@ -1,0 +1,11 @@
+BasedOnStyle: LLVM
+IndentWidth: 8
+TabWidth: 8
+UseTab: Never
+BreakBeforeBraces: Linux
+AllowShortIfStatementsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+ColumnLimit: 100
+SortIncludes: false
+PointerAlignment: Right
+SpaceBeforeParens: ControlStatements

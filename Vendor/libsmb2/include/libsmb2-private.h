@@ -215,6 +215,14 @@ struct smb2_context {
         uint8_t *session_key;
         uint8_t session_key_size;
 
+        /* Server-side compound support: clients that chain requests in one
+         * PDU use the all-0xff placeholder file id on the follow-up
+         * commands to mean "the file the preceding CREATE in this compound
+         * returned". It is only valid within the same compound, so it is
+         * cleared every time a new PDU starts arriving. */
+        smb2_file_id compound_fid;
+        int compound_fid_valid;
+
         uint8_t seal:1;
         int8_t seal_requested;
         uint8_t sign:1;

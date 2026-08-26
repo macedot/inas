@@ -43,7 +43,7 @@ A real device is best. The simulator can share to the Mac on port 4455.
 1. Add files in the Files app: **On My iPhone/iPad → iNAS**
 2. Open iNAS and tap **Start** (allow Local Network if asked)
 3. **Mac:** Finder → Network, or Go → Connect to Server → `smb://<ip>/inas` (or `smb://iNAS.local/inas`)
-4. **Windows:** File Explorer address bar → `\\<ip>\inas` (or `\\iNAS.local\inas` on port 445). Copy the Windows path from the session card if Explorer does not list iNAS under Network.
+4. **Windows:** paste the **Windows** row from the session card into File Explorer (`\\<ip>\inas`, or `\\iNAS.local\inas` on port 445). Network Neighborhood listing needs Apple’s multicast entitlement (not available on a standard development profile), so Explorer often will not show iNAS under Network even though the share is up.
 
 Keep iNAS open while sharing. iOS does not allow a true always-on file server; on iOS 26 the share can continue for a while after you leave the app.
 
@@ -54,7 +54,7 @@ Keep iNAS open while sharing. iOS does not allow a true always-on file server; o
 | User                       | `inas`                          | SMB username (Settings)                                  |
 | Password                   | generated on Start              | 8 letters + 4 digits unless you set a custom password    |
 | New password each Start    | on                              | Off when you type a password; stored in Keychain         |
-| Share name                 | `inas`                          | Documents folder of the app                              |
+| Share name                 | `inas`                          | Built-in Documents folder; extra shares in Settings      |
 | Port                       | `445`, fallback `4455`          | Shown in the address if not 445                          |
 | Protocol                   | SMB 3.0.2+                      | SMB 3.1.1 preferred; v1 never negotiated                 |
 
@@ -76,11 +76,23 @@ open Inas.xcodeproj
 ### Testing
 
 ```bash
-xcodebuild -project Inas.xcodeproj -scheme Inas \
-  -destination 'platform=iOS Simulator,name=iPhone 16' test
+Scripts/test.sh
 ```
 
-Covers password shape, auto vs custom credentials, path sandbox (no `..` escape), and SMB 3-only dialect policy.
+`Scripts/test.sh` applies the vendor patch series (`Scripts/vendor-check.sh`),
+optionally lints with clang-format / swift-format when those tools are
+installed, then runs `xcodebuild test` on an available iPhone simulator.
+
+Covers password shape, auto vs custom credentials, path sandbox (no `..`
+escape), glob matching, auth lockout, WS-Discovery XML/HTTP helpers, and a
+loopback SMB listener (port 0 on 127.0.0.1; SMB 2.x / 3.0.0 refused).
+
+### Bind and lockout
+
+- SMB, WS-Discovery HTTP, and UDP sockets bind the current LAN IPv4 only.
+  A Wi-Fi address change stops the share.
+- More than 10 failed logons within 60 seconds from one peer locks that
+  peer out for 5 minutes.
 
 ## Architecture
 
@@ -126,7 +138,8 @@ Vendor/libsmb2  Upstream libsmb2 sources
 - **Signing required**
 - **No guest / anonymous**
 - **Custom passwords in Keychain**; auto passwords exist only in memory while sharing
-- **Local network only** — no UPnP, WAN, or relay
+- **Local network only** — listeners bind the Wi-Fi IPv4; no UPnP, WAN, or relay
+- **Auth lockout** — more than 10 failed logons / 60 s from one IP → 5-minute block
 - **libsmb2** is linked as a dynamic framework to stay compatible with LGPL 2.1
 
 ## License

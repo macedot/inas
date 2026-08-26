@@ -3,4 +3,9 @@
 
 #include "PathSandbox.h"
 #include "FilesystemShare.h"
+#include "GlobMatch.h"
+#include "AuthThrottle.h"
+#include "DialectPolicy.h"
+#include "SMBClientProbe.h"
+#include "Services/DiscoveryUDP.h"
 #include <dns_sd.h>

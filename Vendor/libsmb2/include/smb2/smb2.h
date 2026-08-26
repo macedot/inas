@@ -221,6 +221,8 @@ struct smb2_tree_connect_reply {
         uint32_t share_flags;
         uint32_t capabilities;
         uint32_t maximal_access;
+        /* Server-side only: 0 lets libsmb2 invent a tree id. */
+        uint32_t tree_id;
 };
 
 #define SMB2_CREATE_REQUEST_SIZE 57

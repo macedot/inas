@@ -10,8 +10,17 @@ struct ShareCredentials: Equatable {
     var usesCustomPassword: Bool
 }
 
+struct SessionPassword: Equatable {
+    let password: String
+    let credentials: ShareCredentials
+}
+
+enum PasswordVaultError: Error {
+    case saveFailed
+}
+
 protocol PasswordVault {
-    func save(_ password: String)
+    func save(_ password: String) throws
     func read() -> String?
     func delete()
 }
@@ -24,7 +33,7 @@ final class KeychainPasswordVault: PasswordVault {
         self.account = account
     }
 
-    func save(_ password: String) {
+    func save(_ password: String) throws {
         delete()
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -33,7 +42,10 @@ final class KeychainPasswordVault: PasswordVault {
             kSecValueData as String: Data(password.utf8),
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
-        SecItemAdd(query as CFDictionary, nil)
+        let status = SecItemAdd(query as CFDictionary, nil)
+        if status != errSecSuccess {
+            throw PasswordVaultError.saveFailed
+        }
     }
 
     func read() -> String? {
@@ -63,7 +75,7 @@ final class KeychainPasswordVault: PasswordVault {
 final class MemoryPasswordVault: PasswordVault {
     private var password: String?
 
-    func save(_ password: String) { self.password = password }
+    func save(_ password: String) throws { self.password = password }
     func read() -> String? { password }
     func delete() { password = nil }
 }
@@ -93,28 +105,29 @@ final class CredentialStore {
         )
     }
 
-    func save(_ credentials: ShareCredentials) {
+    func save(_ credentials: ShareCredentials) throws {
         defaults.set(credentials.username, forKey: Keys.username)
         defaults.set(credentials.usesCustomPassword, forKey: Keys.custom)
         if credentials.usesCustomPassword {
-            vault.save(credentials.password)
+            try vault.save(credentials.password)
         } else {
             vault.delete()
         }
     }
 
-    func passwordForStart(_ credentials: inout ShareCredentials) -> String {
-        if credentials.usesCustomPassword {
-            let trimmed = credentials.password.trimmingCharacters(in: .whitespacesAndNewlines)
+    func passwordForStart(_ credentials: ShareCredentials) throws -> SessionPassword {
+        var next = credentials
+        if next.usesCustomPassword {
+            let trimmed = next.password.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
-                credentials.password = trimmed
-                save(credentials)
-                return trimmed
+                next.password = trimmed
+                try save(next)
+                return SessionPassword(password: trimmed, credentials: next)
             }
         }
-        credentials.usesCustomPassword = false
-        credentials.password = PasswordGenerator.generate()
-        save(credentials)
-        return credentials.password
+        next.usesCustomPassword = false
+        next.password = PasswordGenerator.generate()
+        try save(next)
+        return SessionPassword(password: next.password, credentials: next)
     }
 }

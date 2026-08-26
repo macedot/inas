@@ -173,7 +173,6 @@ smb2_close_context(struct smb2_context *smb2)
         if (smb2 == NULL) {
                 return;
         }
-
         if (SMB2_VALID_SOCKET(smb2->fd)) {
                 if (smb2->change_fd) {
                         smb2->change_fd(smb2, smb2->fd, SMB2_DEL_FD);
@@ -608,7 +607,7 @@ smb3_init_preauth_hash(struct smb2_context *smb2)
 }
 
 /* MS-SMB2 3.2.5.2 */
-static int
+int
 smb3_update_preauth_hash(struct smb2_context *smb2, int niov,
                          struct smb2_iovec *iov)
 {
@@ -627,6 +626,35 @@ smb3_update_preauth_hash(struct smb2_context *smb2, int niov,
 
 static void smb2_create_signing_key(struct smb2_context *smb2)
 {
+        /*
+         * The labels below are named from the client's perspective:
+         * ServerIn/SMBC2SCipherKey protects client-to-server data and
+         * ServerOut/SMBS2CCipherKey protects server-to-client data.
+         * smb3-seal.c always encrypts with serverin_key and decrypts with
+         * serverout_key, so a server context must derive them swapped:
+         * it encrypts S2C and decrypts C2S.
+         */
+        const char *c2s_label = ServerIn;
+        size_t c2s_len = sizeof(ServerIn);
+        const char *s2c_label = ServerOut;
+        size_t s2c_len = sizeof(ServerOut);
+
+        if (smb2->dialect > SMB2_VERSION_0302) {
+                c2s_label = SMBC2SCipherKey;
+                c2s_len = sizeof(SMBC2SCipherKey);
+                s2c_label = SMBS2CCipherKey;
+                s2c_len = sizeof(SMBS2CCipherKey);
+        }
+        if (smb2_is_server(smb2)) {
+                const char *t = c2s_label;
+                size_t tl = c2s_len;
+
+                c2s_label = s2c_label;
+                c2s_len = s2c_len;
+                s2c_label = t;
+                s2c_len = tl;
+        }
+
         /* Derive the signing key from session key
          * This is based on negotiated protocol
          */
@@ -648,15 +676,15 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
                                 smb2->session_key_size,
                                 SMB2AESCCM,
                                 sizeof(SMB2AESCCM),
-                                ServerIn,
-                                sizeof(ServerIn),
+                                c2s_label,
+                                c2s_len,
                                 smb2->serverin_key);
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
                                 SMB2AESCCM,
                                 sizeof(SMB2AESCCM),
-                                ServerOut,
-                                sizeof(ServerOut),
+                                s2c_label,
+                                s2c_len,
                                 smb2->serverout_key);
         } else if (smb2->dialect > SMB2_VERSION_0302) {
                 smb2_derive_key(smb2->session_key,
@@ -668,15 +696,15 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
                                 smb2->signing_key);
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
-                                SMBC2SCipherKey,
-                                sizeof(SMBC2SCipherKey),
+                                c2s_label,
+                                c2s_len,
                                 (char *)smb2->preauthhash,
                                 SMB2_PREAUTH_HASH_SIZE,
                                 smb2->serverin_key);
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
-                                SMBS2CCipherKey,
-                                sizeof(SMBS2CCipherKey),
+                                s2c_label,
+                                s2c_len,
                                 (char *)smb2->preauthhash,
                                 SMB2_PREAUTH_HASH_SIZE,
                                 smb2->serverout_key);
@@ -879,7 +907,6 @@ send_session_setup_request(struct smb2_context *smb2,
                 return -ENOMEM;
         }
         smb2_queue_pdu(smb2, pdu);
-        smb3_update_preauth_hash(smb2, pdu->out.niov, &pdu->out.iov[0]);
 
         return 0;
 }
@@ -1110,7 +1137,6 @@ connect_cb(struct smb2_context *smb2, int status,
                 return;
         }
         smb2_queue_pdu(smb2, pdu);
-        smb3_update_preauth_hash(smb2, pdu->out.niov, &pdu->out.iov[0]);
 }
 
 int
@@ -3461,7 +3487,7 @@ smb2_tree_connect_request_cb(struct smb2_server *server, struct smb2_context *sm
                 ret = server->handlers->tree_connect_cmd(server, smb2, req, &rep);
         }
         if (!ret) {
-                pdu = smb2_cmd_tree_connect_reply_async(smb2, &rep, 0, NULL, cb_data);
+                pdu = smb2_cmd_tree_connect_reply_async(smb2, &rep, rep.tree_id, NULL, cb_data);
         }
         else if (ret < 0) {
                 memset(&err, 0, sizeof(err));
@@ -3515,6 +3541,10 @@ smb2_create_request_cb(struct smb2_server *server, struct smb2_context *smb2, vo
                 ret = server->handlers->create_cmd(server, smb2, req, &rep);
         }
         if (!ret) {
+                /* Remember the file id for follow-up commands in this
+                 * compound that use the placeholder compound_file_id. */
+                memcpy(smb2->compound_fid, rep.file_id, SMB2_FD_SIZE);
+                smb2->compound_fid_valid = 1;
                 pdu = smb2_cmd_create_reply_async(smb2, &rep, NULL, cb_data);
         }
         else if (ret < 0) {
@@ -3830,6 +3860,10 @@ smb2_query_directory_request_cb(struct smb2_server *server, struct smb2_context 
                         pdu = smb2_cmd_query_directory_reply_async(smb2, req, &rep, NULL, cb_data);
                 }
         }
+        if (rep.output_buffer) {
+                free(rep.output_buffer);
+                rep.output_buffer = NULL;
+        }
         if (req->name) {
                 smb2_free_data(smb2, discard_const(req->name));
         }
@@ -3899,6 +3933,10 @@ smb2_query_info_request_cb(struct smb2_server *server, struct smb2_context *smb2
                         pdu = smb2_cmd_query_info_reply_async(smb2, req, &rep, NULL, cb_data);
                 }
         }
+        if (rep.output_buffer) {
+                free(rep.output_buffer);
+                rep.output_buffer = NULL;
+        }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
                 smb2_queue_pdu(smb2, pdu);
@@ -3934,6 +3972,52 @@ smb2_set_info_request_cb(struct smb2_server *server, struct smb2_context *smb2, 
 static void
 smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *command_data, void *cb_data);
 
+/* Replace the all-0xff compound placeholder file id with the file id
+ * returned by the CREATE earlier in this compound (MS-SMB2 3.2.4.1). */
+static void
+smb2_server_fixup_compound_fid(struct smb2_context *smb2, int command, void *d)
+{
+        smb2_file_id *fid = NULL;
+
+        if (!smb2_is_server(smb2) || !smb2->compound_fid_valid || !d) {
+                return;
+        }
+        switch (command) {
+        case SMB2_CLOSE:
+                fid = &((struct smb2_close_request *)d)->file_id;
+                break;
+        case SMB2_FLUSH:
+                fid = &((struct smb2_flush_request *)d)->file_id;
+                break;
+        case SMB2_READ:
+                fid = &((struct smb2_read_request *)d)->file_id;
+                break;
+        case SMB2_WRITE:
+                fid = &((struct smb2_write_request *)d)->file_id;
+                break;
+        case SMB2_LOCK:
+                fid = &((struct smb2_lock_request *)d)->file_id;
+                break;
+        case SMB2_IOCTL:
+                fid = &((struct smb2_ioctl_request *)d)->file_id;
+                break;
+        case SMB2_QUERY_DIRECTORY:
+                fid = &((struct smb2_query_directory_request *)d)->file_id;
+                break;
+        case SMB2_QUERY_INFO:
+                fid = &((struct smb2_query_info_request *)d)->file_id;
+                break;
+        case SMB2_SET_INFO:
+                fid = &((struct smb2_set_info_request *)d)->file_id;
+                break;
+        default:
+                return;
+        }
+        if (memcmp(*fid, compound_file_id, SMB2_FD_SIZE) == 0) {
+                memcpy(*fid, smb2->compound_fid, SMB2_FD_SIZE);
+        }
+}
+
 static void
 smb2_general_client_request_cb(struct smb2_context *smb2, int status, void *command_data, void *cb_data)
 {
@@ -3941,6 +4025,11 @@ smb2_general_client_request_cb(struct smb2_context *smb2, int status, void *comm
         struct smb2_server *server = c_data->server_context;
         enum smb2_command next_cmd = SMB2_TREE_CONNECT;
         smb2_command_cb next_cb = smb2_general_client_request_cb;
+
+        if (status == SMB2_STATUS_SUCCESS && smb2->pdu) {
+                smb2_server_fixup_compound_fid(smb2, smb2->pdu->header.command,
+                                               command_data);
+        }
 
         if (!smb2->pdu) {
                 smb2_set_error(smb2, "No pdu for general client request");
@@ -4133,18 +4222,19 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                 if (message_type == AUTHENTICATION_MESSAGE) {
                         if (!ntlmssp_get_authenticated(c_data->auth_data)) {
                                 smb2_set_error(smb2, "Authentication failed: %s", smb2_get_error(smb2));
-                                #if 0
-                                smb2_close_context(smb2);
-                                return;
-                                #else
+                                if (server->handlers && server->handlers->auth_failed) {
+                                        server->handlers->auth_failed(server, smb2);
+                                }
                                 pdu = smb2_cmd_error_reply_async(smb2,
                                                 &err, SMB2_SESSION_SETUP,
                                                 SMB2_STATUS_LOGON_FAILURE, NULL, cb_data);
-                                smb2_free_pdu(smb2, smb2->next_pdu);
-                                smb2->next_pdu = smb2_allocate_pdu(smb2, SMB2_SESSION_SETUP,
-                                               smb2_session_setup_request_cb, cb_data);
-                                more_processing_needed = 0;
-                                #endif
+                                if (pdu != NULL) {
+                                        smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+                                        smb2_queue_pdu(smb2, pdu);
+                                        (void)smb2_service(smb2, POLLOUT);
+                                }
+                                smb2_close_context(smb2);
+                                return;
                         }
                         if (ntlmssp_get_session_key(c_data->auth_data,
                                                     &smb2->session_key,
@@ -4218,6 +4308,12 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
         }
 
         if (!pdu) {
+                if (smb2->seal && !more_processing_needed) {
+                        /* Tell the client this session encrypts everything
+                         * from here on; the client stops signing and starts
+                         * sealing its requests once it sees this. */
+                        rep.session_flags |= SMB2_SESSION_FLAG_IS_ENCRYPT_DATA;
+                }
                 pdu = smb2_cmd_session_setup_reply_async(smb2, &rep, NULL, cb_data);
                 if (pdu == NULL) {
                         smb2_set_error(smb2, "can not alloc pdu for session setup reply");
@@ -4251,7 +4347,13 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
 
         smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
         smb2_queue_pdu(smb2, pdu);
-        smb3_update_preauth_hash(smb2, pdu->out.niov, &pdu->out.iov[0]);
+        if (!more_processing_needed && smb2->seal) {
+                /* Sealing takes over from signing once the session is up.
+                 * The final session setup response above was signed
+                 * (it cannot be encrypted yet); every later PDU is sealed
+                 * instead, and sealed PDUs are not signed. */
+                smb2->sign = 0;
+        }
 }
 
 static void
@@ -4283,6 +4385,16 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
         smb2->credits = 128;
 
         /* negotiate highest version in request dialects */
+        if (server->allowed_dialect_count > 0) {
+                dialect_count = server->allowed_dialect_count;
+                if (dialect_count > (int)SMB2_NEGOTIATE_MAX_DIALECTS) {
+                        dialect_count = SMB2_NEGOTIATE_MAX_DIALECTS;
+                }
+                for (d = 0; d < dialect_count; d++) {
+                        dialects[d] = server->allowed_dialects[d];
+                }
+                goto dialects_ready;
+        }
         switch (smb2->version) {
         case SMB2_VERSION_ANY:
                 dialect_count = 5;
@@ -4313,6 +4425,7 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
                 dialects[0] = smb2->version;
                 break;
         }
+dialects_ready:
 
         if (req && smb2->pdu->header.command != SMB1_NEGOTIATE) {
                 if (req->dialect_count == 0) {
@@ -4407,9 +4520,19 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
                         }
                 }
 
-                if (smb2->seal) {
-                        smb2->sign = 0;
-                } else if (will_sign) {
+                /*
+                 * Keep signing enabled through session setup even when
+                 * sealing will be used: MS-SMB2 3.2.5.3.1 requires the
+                 * final session setup response to be signed (it is not
+                 * encrypted yet; sealing only starts once authentication
+                 * completes). smb2_session_setup_request_cb() disables
+                 * signing again after the final response is queued.
+                 * smb2_create_signing_key() in the session setup path also
+                 * derives the encryption keys, so zeroing sign here would
+                 * additionally leave the server unable to decrypt sealed
+                 * client PDUs.
+                 */
+                if (!smb2->seal && will_sign) {
                         if (server->signing_enabled) {
                                 smb2->sign = 1;
                         } else {
@@ -4456,7 +4579,6 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
 
         smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
         smb2_queue_pdu(smb2, pdu);
-        smb3_update_preauth_hash(smb2, pdu->out.niov, &pdu->out.iov[0]);
 
         if (req) {
                 /* alloc a pdu for session request */
@@ -4549,7 +4671,8 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                 return err;
         }
 #endif
-        err = smb2_bind_and_listen(server->port, max_connections, &server->fd);
+        err = smb2_bind_and_listen_ip(server->bind_ipv4, server->port,
+                                      max_connections, &server->fd);
         if (err != 0) {
                 return err;
         }
@@ -4568,6 +4691,9 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                 maxfd = server->fd;
 
                 for (smb2 = smb2_active_contexts(); smb2; smb2 = smb2->next) {
+                        if (smb2->owning_server != server) {
+                                continue;
+                        }
                         if (SMB2_VALID_SOCKET(smb2_get_fd(smb2))) {
                                 events = smb2_which_events(smb2);
                                 if (events) {
@@ -4605,6 +4731,9 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
 
                         /* for each client context ready to read, process that context */
                         for (smb2 = smb2_active_contexts(); smb2; smb2 = smb2->next) {
+                                if (smb2->owning_server != server) {
+                                        continue;
+                                }
                                 if (SMB2_VALID_SOCKET(smb2_get_fd(smb2)) && FD_ISSET(smb2_get_fd(smb2), &rfds)) {
                                         if (smb2_service(smb2, POLLIN) < 0) {
                                                 smb2_set_error(smb2, "smb2_service (in) failed with : "
@@ -4667,7 +4796,7 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                          * do only one per iteration since active list changes on destroy
                          */
                         for (smb2 = smb2_active_contexts(); smb2; smb2 = smb2->next) {
-                                if (smb2_is_server(smb2)) {
+                                if (smb2->owning_server == server) {
                                         if (!SMB2_VALID_SOCKET(smb2_get_fd(smb2))) {
                                                 if (server->handlers && server->handlers->destruction_event) {
                                                         server->handlers->destruction_event(server, smb2);
@@ -4676,7 +4805,6 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                                                 break;
                                         }
                                 }
-                                /* client connections are destroyed when they timeout or get disconnected */
                         }
 
                         if (server->extra_service) {
@@ -4725,9 +4853,21 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
         close(server->fd);
         server->fd = -1;
 
-        while (smb2_active_contexts()) {
-                smb2 = smb2_active_contexts();
-                smb2_destroy_context(smb2);
+        for (;;) {
+                struct smb2_context *owned = NULL;
+                for (smb2 = smb2_active_contexts(); smb2; smb2 = smb2->next) {
+                        if (smb2->owning_server == server) {
+                                owned = smb2;
+                                break;
+                        }
+                }
+                if (!owned) {
+                        break;
+                }
+                if (server->handlers && server->handlers->destruction_event) {
+                        server->handlers->destruction_event(server, owned);
+                }
+                smb2_destroy_context(owned);
         }
 #ifdef HAVE_LIBKRB5
         krb5_free_server_credentials(server);

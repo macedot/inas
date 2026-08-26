@@ -3,6 +3,8 @@
 
 #include "PathSandbox.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,8 +12,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int
-is_safe_component(const char *comp, size_t len)
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
+#endif
+#ifndef NAME_MAX
+#define NAME_MAX 255
+#endif
+
+static int is_safe_component(const char *comp, size_t len)
 {
         if (len == 0) {
                 return 0;
@@ -20,6 +31,9 @@ is_safe_component(const char *comp, size_t len)
                 return 1;
         }
         if (len == 2 && comp[0] == '.' && comp[1] == '.') {
+                return 0;
+        }
+        if (len > NAME_MAX) {
                 return 0;
         }
         for (size_t i = 0; i < len; i++) {
@@ -31,8 +45,7 @@ is_safe_component(const char *comp, size_t len)
         return 1;
 }
 
-static int
-realpath_prefix_ok(const char *root_real, const char *candidate)
+static int realpath_prefix_ok(const char *root_real, const char *candidate)
 {
         size_t root_len = strlen(root_real);
         size_t cand_len = strlen(candidate);
@@ -48,8 +61,95 @@ realpath_prefix_ok(const char *root_real, const char *candidate)
         return candidate[root_len] == '/';
 }
 
-int
-inas_path_resolve(const char *root, const char *smb_name, char *out, size_t out_len)
+void inas_path_release(inas_path *p)
+{
+        if (!p) {
+                return;
+        }
+        if (p->dirfd >= 0) {
+                close(p->dirfd);
+        }
+        p->dirfd = -1;
+        p->name[0] = '\0';
+}
+
+int inas_path_resolve_at(int rootfd, const char *smb_name, inas_path *out)
+{
+        int dirfd;
+        const char *name;
+        const char *p;
+
+        if (!out || rootfd < 0) {
+                return -1;
+        }
+        memset(out, 0, sizeof(*out));
+        out->dirfd = -1;
+
+        dirfd = dup(rootfd);
+        if (dirfd < 0) {
+                return -1;
+        }
+
+        name = smb_name ? smb_name : "";
+        while (*name == '\\' || *name == '/') {
+                name++;
+        }
+        if (name[0] == '\0' || strcmp(name, ".") == 0) {
+                out->dirfd = dirfd;
+                out->name[0] = '\0';
+                return 0;
+        }
+
+        p = name;
+        while (*p) {
+                const char *start = p;
+                while (*p && *p != '\\' && *p != '/') {
+                        p++;
+                }
+                size_t seglen = (size_t)(p - start);
+                int last;
+                while (*p == '\\' || *p == '/') {
+                        p++;
+                }
+                last = (*p == '\0');
+                if (seglen == 0) {
+                        continue;
+                }
+                if (!is_safe_component(start, seglen)) {
+                        close(dirfd);
+                        return -1;
+                }
+                if (seglen == 1 && start[0] == '.') {
+                        continue;
+                }
+                if (last) {
+                        if (seglen >= sizeof(out->name)) {
+                                close(dirfd);
+                                return -1;
+                        }
+                        memcpy(out->name, start, seglen);
+                        out->name[seglen] = '\0';
+                        out->dirfd = dirfd;
+                        return 0;
+                }
+                char component[NAME_MAX + 1];
+                memcpy(component, start, seglen);
+                component[seglen] = '\0';
+                int next =
+                    openat(dirfd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                close(dirfd);
+                if (next < 0) {
+                        return -1;
+                }
+                dirfd = next;
+        }
+
+        out->dirfd = dirfd;
+        out->name[0] = '\0';
+        return 0;
+}
+
+int inas_path_resolve(const char *root, const char *smb_name, char *out, size_t out_len)
 {
         char root_real[PATH_MAX];
         char built[PATH_MAX];
@@ -122,7 +222,6 @@ inas_path_resolve(const char *root, const char *smb_name, char *out, size_t out_
                 return -1;
         }
 
-        /* Existing path: canonicalize and re-check. */
         if (realpath(built, tmp)) {
                 if (!realpath_prefix_ok(root_real, tmp)) {
                         return -1;
@@ -134,7 +233,6 @@ inas_path_resolve(const char *root, const char *smb_name, char *out, size_t out_
                 return 0;
         }
 
-        /* New path: parent must exist inside the root. */
         char *slash = strrchr(built, '/');
         if (!slash || slash == built) {
                 return -1;

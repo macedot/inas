@@ -1,0 +1,52 @@
+diff --git a/Vendor/libsmb2/include/smb2/libsmb2.h b/Vendor/libsmb2/include/smb2/libsmb2.h
+index ae65e22..8d0f89e 100644
+--- a/Vendor/libsmb2/include/smb2/libsmb2.h
++++ b/Vendor/libsmb2/include/smb2/libsmb2.h
+@@ -1538,6 +1538,8 @@ struct smb2_server {
+                               fd_set *rfds, fd_set *wfds);
+         void *opaque;
+         char bind_ipv4[16];
++        uint16_t allowed_dialects[8];
++        int allowed_dialect_count;
+ };
+ 
+ int smb2_bind_and_listen(const uint16_t port, const int max_connections, int *out_fd);
+diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Vendor/libsmb2/lib/libsmb2.c
+index 54e3f8c..3b8dfdd 100644
+--- a/Vendor/libsmb2/lib/libsmb2.c
++++ b/Vendor/libsmb2/lib/libsmb2.c
+@@ -4292,6 +4292,16 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
+         smb2->credits = 128;
+ 
+         /* negotiate highest version in request dialects */
++        if (server->allowed_dialect_count > 0) {
++                dialect_count = server->allowed_dialect_count;
++                if (dialect_count > (int)SMB2_NEGOTIATE_MAX_DIALECTS) {
++                        dialect_count = SMB2_NEGOTIATE_MAX_DIALECTS;
++                }
++                for (d = 0; d < dialect_count; d++) {
++                        dialects[d] = server->allowed_dialects[d];
++                }
++                goto dialects_ready;
++        }
+         switch (smb2->version) {
+         case SMB2_VERSION_ANY:
+                 dialect_count = 5;
+@@ -4322,6 +4332,7 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
+                 dialects[0] = smb2->version;
+                 break;
+         }
++dialects_ready:
+ 
+         if (req && smb2->pdu->header.command != SMB1_NEGOTIATE) {
+                 if (req->dialect_count == 0) {
+@@ -4751,6 +4762,9 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
+                 if (!owned) {
+                         break;
+                 }
++                if (server->handlers && server->handlers->destruction_event) {
++                        server->handlers->destruction_event(server, owned);
++                }
+                 smb2_destroy_context(owned);
+         }
+ #ifdef HAVE_LIBKRB5

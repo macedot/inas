@@ -1,0 +1,115 @@
+diff --git a/Vendor/libsmb2/include/smb2/libsmb2.h b/Vendor/libsmb2/include/smb2/libsmb2.h
+index fa6861f..ae65e22 100644
+--- a/Vendor/libsmb2/include/smb2/libsmb2.h
++++ b/Vendor/libsmb2/include/smb2/libsmb2.h
+@@ -1496,6 +1496,7 @@ struct smb2_server_request_handlers {
+                             struct smb2_query_info_reply *rep);
+         int (*set_info_cmd)(struct smb2_server *srvr, struct smb2_context *smb2,
+                             struct smb2_set_info_request *req);
++        int (*auth_failed)(struct smb2_server *srvr, struct smb2_context *smb2);
+         /*
+         int (*oplock_break cmd)(struct smb2_server *srvr, struct smb2_context *smb2,
+                             struct smb2_oplock_break_request *req);
+@@ -1535,9 +1536,13 @@ struct smb2_server {
+                             fd_set *rfds, fd_set *wfds, int *maxfd);
+         void (*extra_service)(struct smb2_server *server,
+                               fd_set *rfds, fd_set *wfds);
++        void *opaque;
++        char bind_ipv4[16];
+ };
+ 
+ int smb2_bind_and_listen(const uint16_t port, const int max_connections, int *out_fd);
++int smb2_bind_and_listen_ip(const char *ipv4, const uint16_t port,
++                            const int max_connections, int *out_fd);
+ int smb2_accept_connection_async(const int fd, const int to_msecs, smb2_accepted_cb cb, void *cb_data);
+ int smb2_serve_port_async(const int fd, const int to_msecs, struct smb2_context **out_smb2);
+ 
+diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Vendor/libsmb2/lib/libsmb2.c
+index 903ca04..e9ecf73 100644
+--- a/Vendor/libsmb2/lib/libsmb2.c
++++ b/Vendor/libsmb2/lib/libsmb2.c
+@@ -4141,18 +4141,18 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
+                 if (message_type == AUTHENTICATION_MESSAGE) {
+                         if (!ntlmssp_get_authenticated(c_data->auth_data)) {
+                                 smb2_set_error(smb2, "Authentication failed: %s", smb2_get_error(smb2));
+-                                #if 0
+-                                smb2_close_context(smb2);
+-                                return;
+-                                #else
++                                if (server->handlers && server->handlers->auth_failed) {
++                                        server->handlers->auth_failed(server, smb2);
++                                }
+                                 pdu = smb2_cmd_error_reply_async(smb2,
+                                                 &err, SMB2_SESSION_SETUP,
+                                                 SMB2_STATUS_LOGON_FAILURE, NULL, cb_data);
+-                                smb2_free_pdu(smb2, smb2->next_pdu);
+-                                smb2->next_pdu = smb2_allocate_pdu(smb2, SMB2_SESSION_SETUP,
+-                                               smb2_session_setup_request_cb, cb_data);
+-                                more_processing_needed = 0;
+-                                #endif
++                                if (pdu != NULL) {
++                                        smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
++                                        smb2_queue_pdu(smb2, pdu);
++                                }
++                                smb2_close_context(smb2);
++                                return;
+                         }
+                         if (ntlmssp_get_session_key(c_data->auth_data,
+                                                     &smb2->session_key,
+@@ -4557,7 +4557,8 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
+                 return err;
+         }
+ #endif
+-        err = smb2_bind_and_listen(server->port, max_connections, &server->fd);
++        err = smb2_bind_and_listen_ip(server->bind_ipv4, server->port,
++                                      max_connections, &server->fd);
+         if (err != 0) {
+                 return err;
+         }
+diff --git a/Vendor/libsmb2/lib/socket.c b/Vendor/libsmb2/lib/socket.c
+index d952c24..7fc5d21 100644
+--- a/Vendor/libsmb2/lib/socket.c
++++ b/Vendor/libsmb2/lib/socket.c
+@@ -1516,12 +1516,20 @@ smb2_connect_async(struct smb2_context *smb2, const char *server,
+ 
+ int
+ smb2_bind_and_listen(const uint16_t port, const int max_connections, int *out_fd)
++{
++        return smb2_bind_and_listen_ip(NULL, port, max_connections, out_fd);
++}
++
++int
++smb2_bind_and_listen_ip(const char *ipv4, const uint16_t port,
++                        const int max_connections, int *out_fd)
+ {
+         t_socket fd;
+         socklen_t socksize;
+         struct sockaddr_in serv_addr;
++        int yes = 1;
+ 
+-             *out_fd = -1;
++        *out_fd = -1;
+ 
+         fd = socket(AF_INET, SOCK_STREAM, 0);
+         if (!SMB2_VALID_SOCKET(fd)) {
+@@ -1530,10 +1538,19 @@ smb2_bind_and_listen(const uint16_t port, const int max_connections, int *out_fd
+ 
+         set_nonblocking(fd);
+         set_tcp_sockopt(fd, TCP_NODELAY, 1);
++        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+ 
++        memset(&serv_addr, 0, sizeof(serv_addr));
+         serv_addr.sin_port = htons(port);
+         serv_addr.sin_family = AF_INET;
+-        serv_addr.sin_addr.s_addr = INADDR_ANY;
++        if (ipv4 && ipv4[0]) {
++                if (inet_pton(AF_INET, ipv4, &serv_addr.sin_addr) != 1) {
++                        close(fd);
++                        return -EINVAL;
++                }
++        } else {
++                serv_addr.sin_addr.s_addr = INADDR_ANY;
++        }
+         socksize = sizeof(serv_addr);
+ 
+         if (bind(fd, (struct sockaddr *)&serv_addr, socksize) != 0

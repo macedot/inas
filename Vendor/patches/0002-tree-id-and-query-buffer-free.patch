@@ -1,0 +1,48 @@
+diff --git a/Vendor/libsmb2/include/smb2/smb2.h b/Vendor/libsmb2/include/smb2/smb2.h
+index 1df9785..368ef8d 100644
+--- a/Vendor/libsmb2/include/smb2/smb2.h
++++ b/Vendor/libsmb2/include/smb2/smb2.h
+@@ -221,6 +221,8 @@ struct smb2_tree_connect_reply {
+         uint32_t share_flags;
+         uint32_t capabilities;
+         uint32_t maximal_access;
++        /* Server-side only: 0 lets libsmb2 invent a tree id. */
++        uint32_t tree_id;
+ };
+ 
+ #define SMB2_CREATE_REQUEST_SIZE 57
+diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Vendor/libsmb2/lib/libsmb2.c
+index ab76fcb..903ca04 100644
+--- a/Vendor/libsmb2/lib/libsmb2.c
++++ b/Vendor/libsmb2/lib/libsmb2.c
+@@ -3461,7 +3461,7 @@ smb2_tree_connect_request_cb(struct smb2_server *server, struct smb2_context *sm
+                 ret = server->handlers->tree_connect_cmd(server, smb2, req, &rep);
+         }
+         if (!ret) {
+-                pdu = smb2_cmd_tree_connect_reply_async(smb2, &rep, 0, NULL, cb_data);
++                pdu = smb2_cmd_tree_connect_reply_async(smb2, &rep, rep.tree_id, NULL, cb_data);
+         }
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+@@ -3830,6 +3830,10 @@ smb2_query_directory_request_cb(struct smb2_server *server, struct smb2_context
+                         pdu = smb2_cmd_query_directory_reply_async(smb2, req, &rep, NULL, cb_data);
+                 }
+         }
++        if (rep.output_buffer) {
++                free(rep.output_buffer);
++                rep.output_buffer = NULL;
++        }
+         if (req->name) {
+                 smb2_free_data(smb2, discard_const(req->name));
+         }
+@@ -3899,6 +3903,10 @@ smb2_query_info_request_cb(struct smb2_server *server, struct smb2_context *smb2
+                         pdu = smb2_cmd_query_info_reply_async(smb2, req, &rep, NULL, cb_data);
+                 }
+         }
++        if (rep.output_buffer) {
++                free(rep.output_buffer);
++                rep.output_buffer = NULL;
++        }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+                 smb2_queue_pdu(smb2, pdu);

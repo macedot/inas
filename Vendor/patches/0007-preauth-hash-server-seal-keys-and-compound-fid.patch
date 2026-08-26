@@ -1,0 +1,324 @@
+diff --git a/Vendor/libsmb2/include/libsmb2-private.h b/Vendor/libsmb2/include/libsmb2-private.h
+index e441376..9e1befd 100644
+--- a/Vendor/libsmb2/include/libsmb2-private.h
++++ b/Vendor/libsmb2/include/libsmb2-private.h
+@@ -215,6 +215,14 @@ struct smb2_context {
+         uint8_t *session_key;
+         uint8_t session_key_size;
+ 
++        /* Server-side compound support: clients that chain requests in one
++         * PDU use the all-0xff placeholder file id on the follow-up
++         * commands to mean "the file the preceding CREATE in this compound
++         * returned". It is only valid within the same compound, so it is
++         * cleared every time a new PDU starts arriving. */
++        smb2_file_id compound_fid;
++        int compound_fid_valid;
++
+         uint8_t seal:1;
+         int8_t seal_requested;
+         uint8_t sign:1;
+diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Vendor/libsmb2/lib/libsmb2.c
+index 3b8dfdd..0115f48 100644
+--- a/Vendor/libsmb2/lib/libsmb2.c
++++ b/Vendor/libsmb2/lib/libsmb2.c
+@@ -173,7 +173,6 @@ smb2_close_context(struct smb2_context *smb2)
+         if (smb2 == NULL) {
+                 return;
+         }
+-
+         if (SMB2_VALID_SOCKET(smb2->fd)) {
+                 if (smb2->change_fd) {
+                         smb2->change_fd(smb2, smb2->fd, SMB2_DEL_FD);
+@@ -608,7 +607,7 @@ smb3_init_preauth_hash(struct smb2_context *smb2)
+ }
+ 
+ /* MS-SMB2 3.2.5.2 */
+-static int
++int
+ smb3_update_preauth_hash(struct smb2_context *smb2, int niov,
+                          struct smb2_iovec *iov)
+ {
+@@ -627,6 +626,35 @@ smb3_update_preauth_hash(struct smb2_context *smb2, int niov,
+ 
+ static void smb2_create_signing_key(struct smb2_context *smb2)
+ {
++        /*
++         * The labels below are named from the client's perspective:
++         * ServerIn/SMBC2SCipherKey protects client-to-server data and
++         * ServerOut/SMBS2CCipherKey protects server-to-client data.
++         * smb3-seal.c always encrypts with serverin_key and decrypts with
++         * serverout_key, so a server context must derive them swapped:
++         * it encrypts S2C and decrypts C2S.
++         */
++        const char *c2s_label = ServerIn;
++        size_t c2s_len = sizeof(ServerIn);
++        const char *s2c_label = ServerOut;
++        size_t s2c_len = sizeof(ServerOut);
++
++        if (smb2->dialect > SMB2_VERSION_0302) {
++                c2s_label = SMBC2SCipherKey;
++                c2s_len = sizeof(SMBC2SCipherKey);
++                s2c_label = SMBS2CCipherKey;
++                s2c_len = sizeof(SMBS2CCipherKey);
++        }
++        if (smb2_is_server(smb2)) {
++                const char *t = c2s_label;
++                size_t tl = c2s_len;
++
++                c2s_label = s2c_label;
++                c2s_len = s2c_len;
++                s2c_label = t;
++                s2c_len = tl;
++        }
++
+         /* Derive the signing key from session key
+          * This is based on negotiated protocol
+          */
+@@ -648,15 +676,15 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
+                                 smb2->session_key_size,
+                                 SMB2AESCCM,
+                                 sizeof(SMB2AESCCM),
+-                                ServerIn,
+-                                sizeof(ServerIn),
++                                c2s_label,
++                                c2s_len,
+                                 smb2->serverin_key);
+                 smb2_derive_key(smb2->session_key,
+                                 smb2->session_key_size,
+                                 SMB2AESCCM,
+                                 sizeof(SMB2AESCCM),
+-                                ServerOut,
+-                                sizeof(ServerOut),
++                                s2c_label,
++                                s2c_len,
+                                 smb2->serverout_key);
+         } else if (smb2->dialect > SMB2_VERSION_0302) {
+                 smb2_derive_key(smb2->session_key,
+@@ -668,15 +696,15 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
+                                 smb2->signing_key);
+                 smb2_derive_key(smb2->session_key,
+                                 smb2->session_key_size,
+-                                SMBC2SCipherKey,
+-                                sizeof(SMBC2SCipherKey),
++                                c2s_label,
++                                c2s_len,
+                                 (char *)smb2->preauthhash,
+                                 SMB2_PREAUTH_HASH_SIZE,
+                                 smb2->serverin_key);
+                 smb2_derive_key(smb2->session_key,
+                                 smb2->session_key_size,
+-                                SMBS2CCipherKey,
+-                                sizeof(SMBS2CCipherKey),
++                                s2c_label,
++                                s2c_len,
+                                 (char *)smb2->preauthhash,
+                                 SMB2_PREAUTH_HASH_SIZE,
+                                 smb2->serverout_key);
+@@ -879,7 +907,6 @@ send_session_setup_request(struct smb2_context *smb2,
+                 return -ENOMEM;
+         }
+         smb2_queue_pdu(smb2, pdu);
+-        smb3_update_preauth_hash(smb2, pdu->out.niov, &pdu->out.iov[0]);
+ 
+         return 0;
+ }
+@@ -1110,7 +1137,6 @@ connect_cb(struct smb2_context *smb2, int status,
+                 return;
+         }
+         smb2_queue_pdu(smb2, pdu);
+-        smb3_update_preauth_hash(smb2, pdu->out.niov, &pdu->out.iov[0]);
+ }
+ 
+ int
+@@ -3515,6 +3541,10 @@ smb2_create_request_cb(struct smb2_server *server, struct smb2_context *smb2, vo
+                 ret = server->handlers->create_cmd(server, smb2, req, &rep);
+         }
+         if (!ret) {
++                /* Remember the file id for follow-up commands in this
++                 * compound that use the placeholder compound_file_id. */
++                memcpy(smb2->compound_fid, rep.file_id, SMB2_FD_SIZE);
++                smb2->compound_fid_valid = 1;
+                 pdu = smb2_cmd_create_reply_async(smb2, &rep, NULL, cb_data);
+         }
+         else if (ret < 0) {
+@@ -3942,6 +3972,52 @@ smb2_set_info_request_cb(struct smb2_server *server, struct smb2_context *smb2,
+ static void
+ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *command_data, void *cb_data);
+ 
++/* Replace the all-0xff compound placeholder file id with the file id
++ * returned by the CREATE earlier in this compound (MS-SMB2 3.2.4.1). */
++static void
++smb2_server_fixup_compound_fid(struct smb2_context *smb2, int command, void *d)
++{
++        smb2_file_id *fid = NULL;
++
++        if (!smb2_is_server(smb2) || !smb2->compound_fid_valid || !d) {
++                return;
++        }
++        switch (command) {
++        case SMB2_CLOSE:
++                fid = &((struct smb2_close_request *)d)->file_id;
++                break;
++        case SMB2_FLUSH:
++                fid = &((struct smb2_flush_request *)d)->file_id;
++                break;
++        case SMB2_READ:
++                fid = &((struct smb2_read_request *)d)->file_id;
++                break;
++        case SMB2_WRITE:
++                fid = &((struct smb2_write_request *)d)->file_id;
++                break;
++        case SMB2_LOCK:
++                fid = &((struct smb2_lock_request *)d)->file_id;
++                break;
++        case SMB2_IOCTL:
++                fid = &((struct smb2_ioctl_request *)d)->file_id;
++                break;
++        case SMB2_QUERY_DIRECTORY:
++                fid = &((struct smb2_query_directory_request *)d)->file_id;
++                break;
++        case SMB2_QUERY_INFO:
++                fid = &((struct smb2_query_info_request *)d)->file_id;
++                break;
++        case SMB2_SET_INFO:
++                fid = &((struct smb2_set_info_request *)d)->file_id;
++                break;
++        default:
++                return;
++        }
++        if (memcmp(*fid, compound_file_id, SMB2_FD_SIZE) == 0) {
++                memcpy(*fid, smb2->compound_fid, SMB2_FD_SIZE);
++        }
++}
++
+ static void
+ smb2_general_client_request_cb(struct smb2_context *smb2, int status, void *command_data, void *cb_data)
+ {
+@@ -3950,6 +4026,11 @@ smb2_general_client_request_cb(struct smb2_context *smb2, int status, void *comm
+         enum smb2_command next_cmd = SMB2_TREE_CONNECT;
+         smb2_command_cb next_cb = smb2_general_client_request_cb;
+ 
++        if (status == SMB2_STATUS_SUCCESS && smb2->pdu) {
++                smb2_server_fixup_compound_fid(smb2, smb2->pdu->header.command,
++                                               command_data);
++        }
++
+         if (!smb2->pdu) {
+                 smb2_set_error(smb2, "No pdu for general client request");
+                 smb2_close_context(smb2);
+@@ -4227,6 +4308,12 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
+         }
+ 
+         if (!pdu) {
++                if (smb2->seal && !more_processing_needed) {
++                        /* Tell the client this session encrypts everything
++                         * from here on; the client stops signing and starts
++                         * sealing its requests once it sees this. */
++                        rep.session_flags |= SMB2_SESSION_FLAG_IS_ENCRYPT_DATA;
++                }
+                 pdu = smb2_cmd_session_setup_reply_async(smb2, &rep, NULL, cb_data);
+                 if (pdu == NULL) {
+                         smb2_set_error(smb2, "can not alloc pdu for session setup reply");
+@@ -4260,7 +4347,13 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
+ 
+         smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+         smb2_queue_pdu(smb2, pdu);
+-        smb3_update_preauth_hash(smb2, pdu->out.niov, &pdu->out.iov[0]);
++        if (!more_processing_needed && smb2->seal) {
++                /* Sealing takes over from signing once the session is up.
++                 * The final session setup response above was signed
++                 * (it cannot be encrypted yet); every later PDU is sealed
++                 * instead, and sealed PDUs are not signed. */
++                smb2->sign = 0;
++        }
+ }
+ 
+ static void
+@@ -4427,9 +4520,19 @@ dialects_ready:
+                         }
+                 }
+ 
+-                if (smb2->seal) {
+-                        smb2->sign = 0;
+-                } else if (will_sign) {
++                /*
++                 * Keep signing enabled through session setup even when
++                 * sealing will be used: MS-SMB2 3.2.5.3.1 requires the
++                 * final session setup response to be signed (it is not
++                 * encrypted yet; sealing only starts once authentication
++                 * completes). smb2_session_setup_request_cb() disables
++                 * signing again after the final response is queued.
++                 * smb2_create_signing_key() in the session setup path also
++                 * derives the encryption keys, so zeroing sign here would
++                 * additionally leave the server unable to decrypt sealed
++                 * client PDUs.
++                 */
++                if (!smb2->seal && will_sign) {
+                         if (server->signing_enabled) {
+                                 smb2->sign = 1;
+                         } else {
+@@ -4476,7 +4579,6 @@ dialects_ready:
+ 
+         smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+         smb2_queue_pdu(smb2, pdu);
+-        smb3_update_preauth_hash(smb2, pdu->out.niov, &pdu->out.iov[0]);
+ 
+         if (req) {
+                 /* alloc a pdu for session request */
+diff --git a/Vendor/libsmb2/lib/pdu.c b/Vendor/libsmb2/lib/pdu.c
+index 309f7d3..ec21f14 100644
+--- a/Vendor/libsmb2/lib/pdu.c
++++ b/Vendor/libsmb2/lib/pdu.c
+@@ -708,6 +708,20 @@ smb2_queue_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu)
+                 }
+         }
+ 
++        /*
++         * MS-SMB2 3.2.5.2: the preauth integrity hash covers every
++         * NEGOTIATE and SESSION_SETUP message, hashed exactly once with the
++         * signature in its final form. It has to happen here: the
++         * opportunistic write in smb2_add_to_outqueue() consumes the out
++         * vectors, so callers hashing after smb2_queue_pdu() would hash
++         * zero bytes on fast links. Sealed PDUs never reach the hash: only
++         * negotiate/session setup are covered, and those are never sealed.
++         */
++        if (pdu->header.command == SMB2_NEGOTIATE ||
++            pdu->header.command == SMB2_SESSION_SETUP) {
++                smb3_update_preauth_hash(smb2, pdu->out.niov, &pdu->out.iov[0]);
++        }
++
+         smb3_encrypt_pdu(smb2, pdu);
+ 
+         smb2_add_to_outqueue(smb2, pdu);
+diff --git a/Vendor/libsmb2/lib/smb3-seal.h b/Vendor/libsmb2/lib/smb3-seal.h
+index 69a98fc..d1b1d6b 100644
+--- a/Vendor/libsmb2/lib/smb3-seal.h
++++ b/Vendor/libsmb2/lib/smb3-seal.h
+@@ -35,6 +35,12 @@ smb3_encrypt_pdu(struct smb2_context *smb2,
+                  struct smb2_pdu *pdu);
+ int
+ smb3_decrypt_pdu(struct smb2_context *smb2);
++/* MS-SMB2 3.2.5.2 preauth integrity hash (SMB 3.1.1). Defined in
++ * libsmb2.c; called from pdu.c when NEGOTIATE/SESSION_SETUP PDUs are
++ * queued, i.e. after signing but before the out vectors are consumed. */
++int
++smb3_update_preauth_hash(struct smb2_context *smb2, int niov,
++                         struct smb2_iovec *iov);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/Vendor/libsmb2/lib/socket.c b/Vendor/libsmb2/lib/socket.c
+index 7fc5d21..5a4aa5f 100644
+--- a/Vendor/libsmb2/lib/socket.c
++++ b/Vendor/libsmb2/lib/socket.c
+@@ -438,6 +438,10 @@ read_more_data:
+                         return -1;
+                 }
+                 smb2->recv_state = SMB2_RECV_HEADER;
++                if (smb2_is_server(smb2)) {
++                        /* compound placeholder file ids never cross PDUs */
++                        smb2->compound_fid_valid = 0;
++                }
+                 if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
+                                   SMB2_HEADER_SIZE, NULL) == NULL) {
+                         smb2_set_error(smb2, "Too many I/O vectors when adding header");

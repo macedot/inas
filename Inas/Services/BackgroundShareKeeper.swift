@@ -6,7 +6,7 @@ import UIKit
 import UserNotifications
 
 @MainActor
-final class BackgroundShareKeeper {
+final class BackgroundShareKeeper: BackgroundShareKeeping {
     static let taskIdentifier = "app.inas.Inas.share-session"
 
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid

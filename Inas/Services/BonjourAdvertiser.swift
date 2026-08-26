@@ -1,26 +1,56 @@
 // Copyright (C) 2026 Thiago Macedo
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import Darwin
 import Foundation
 
-final class BonjourAdvertiser: NSObject, NetServiceDelegate {
+final class BonjourAdvertiser: BonjourAdvertising {
     static let serviceName = "iNAS"
-
-    private var netService: NetService?
+    private var service: DNSServiceRef?
 
     func start(port: UInt16) {
         stop()
-        let service = NetService(domain: "local.", type: "_smb._tcp.", name: Self.serviceName, port: Int32(port))
-        service.includesPeerToPeer = false
-        service.delegate = self
-        service.setTXTRecord(NetService.data(fromTXTRecord: ["path": Data("/inas".utf8)]))
-        service.publish()
-        netService = service
+        let pair = "path=/inas"
+        var txt = Data([UInt8(pair.utf8.count)])
+        txt.append(contentsOf: pair.utf8)
+        var sdRef: DNSServiceRef?
+        let err: DNSServiceErrorType = txt.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return DNSServiceErrorType(kDNSServiceErr_Unknown) }
+            return Self.serviceName.withCString { namePtr in
+                "_smb._tcp".withCString { typePtr in
+                    DNSServiceRegister(
+                        &sdRef,
+                        0,
+                        0,
+                        namePtr,
+                        typePtr,
+                        "local.",
+                        nil,
+                        port.bigEndian,
+                        UInt16(txt.count),
+                        base,
+                        nil,
+                        nil
+                    )
+                }
+            }
+        }
+        guard err == kDNSServiceErr_NoError, let registered = sdRef else { return }
+        guard DNSServiceSetDispatchQueue(registered, .main) == kDNSServiceErr_NoError else {
+            DNSServiceRefDeallocate(registered)
+            return
+        }
+        service = registered
     }
 
     func stop() {
-        netService?.stop()
-        netService?.delegate = nil
-        netService = nil
+        if let service {
+            DNSServiceRefDeallocate(service)
+        }
+        service = nil
+    }
+
+    deinit {
+        stop()
     }
 }

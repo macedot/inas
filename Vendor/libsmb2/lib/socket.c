@@ -438,6 +438,10 @@ read_more_data:
                         return -1;
                 }
                 smb2->recv_state = SMB2_RECV_HEADER;
+                if (smb2_is_server(smb2)) {
+                        /* compound placeholder file ids never cross PDUs */
+                        smb2->compound_fid_valid = 0;
+                }
                 if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
                                   SMB2_HEADER_SIZE, NULL) == NULL) {
                         smb2_set_error(smb2, "Too many I/O vectors when adding header");
@@ -1517,11 +1521,19 @@ smb2_connect_async(struct smb2_context *smb2, const char *server,
 int
 smb2_bind_and_listen(const uint16_t port, const int max_connections, int *out_fd)
 {
+        return smb2_bind_and_listen_ip(NULL, port, max_connections, out_fd);
+}
+
+int
+smb2_bind_and_listen_ip(const char *ipv4, const uint16_t port,
+                        const int max_connections, int *out_fd)
+{
         t_socket fd;
         socklen_t socksize;
         struct sockaddr_in serv_addr;
+        int yes = 1;
 
-             *out_fd = -1;
+        *out_fd = -1;
 
         fd = socket(AF_INET, SOCK_STREAM, 0);
         if (!SMB2_VALID_SOCKET(fd)) {
@@ -1530,10 +1542,19 @@ smb2_bind_and_listen(const uint16_t port, const int max_connections, int *out_fd
 
         set_nonblocking(fd);
         set_tcp_sockopt(fd, TCP_NODELAY, 1);
+        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
+        memset(&serv_addr, 0, sizeof(serv_addr));
         serv_addr.sin_port = htons(port);
         serv_addr.sin_family = AF_INET;
-        serv_addr.sin_addr.s_addr = INADDR_ANY;
+        if (ipv4 && ipv4[0]) {
+                if (inet_pton(AF_INET, ipv4, &serv_addr.sin_addr) != 1) {
+                        close(fd);
+                        return -EINVAL;
+                }
+        } else {
+                serv_addr.sin_addr.s_addr = INADDR_ANY;
+        }
         socksize = sizeof(serv_addr);
 
         if (bind(fd, (struct sockaddr *)&serv_addr, socksize) != 0

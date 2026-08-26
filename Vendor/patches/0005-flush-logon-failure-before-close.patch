@@ -1,0 +1,12 @@
+diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Vendor/libsmb2/lib/libsmb2.c
+index b40af5d..54e3f8c 100644
+--- a/Vendor/libsmb2/lib/libsmb2.c
++++ b/Vendor/libsmb2/lib/libsmb2.c
+@@ -4150,6 +4150,7 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
+                                 if (pdu != NULL) {
+                                         smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+                                         smb2_queue_pdu(smb2, pdu);
++                                        (void)smb2_service(smb2, POLLOUT);
+                                 }
+                                 smb2_close_context(smb2);
+                                 return;

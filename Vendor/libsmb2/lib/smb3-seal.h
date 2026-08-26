@@ -35,6 +35,12 @@ smb3_encrypt_pdu(struct smb2_context *smb2,
                  struct smb2_pdu *pdu);
 int
 smb3_decrypt_pdu(struct smb2_context *smb2);
+/* MS-SMB2 3.2.5.2 preauth integrity hash (SMB 3.1.1). Defined in
+ * libsmb2.c; called from pdu.c when NEGOTIATE/SESSION_SETUP PDUs are
+ * queued, i.e. after signing but before the out vectors are consumed. */
+int
+smb3_update_preauth_hash(struct smb2_context *smb2, int niov,
+                         struct smb2_iovec *iov);
 
 #ifdef __cplusplus
 }

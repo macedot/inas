@@ -6,26 +6,24 @@ import Foundation
 struct SMBEndpoint: Equatable {
     var ip: String
     var port: UInt16
-    var share: String
 
     var smbURL: String {
         if port == 445 {
-            return "smb://\(ip)/\(share)"
+            return "smb://\(ip)"
         }
-        return "smb://\(ip):\(port)/\(share)"
+        return "smb://\(ip):\(port)"
     }
 
     var windowsHint: String {
         if port == 445 {
-            return "\\\\\(ip)\\\(share)"
+            return "\\\\\(ip)"
         }
-        return "\\\\\(ip)@\(port)\\\(share)"
+        return "\\\\\(ip)@\(port)"
     }
 
-    /// Name-based UNC. Windows Explorer talks SMB on 445 only.
     var windowsNameHint: String? {
         guard port == 445 else { return nil }
-        return "\\\\\(WindowsDiscovery.localName)\\\(share)"
+        return "\\\\\(WindowsDiscovery.localName)"
     }
 }
 
@@ -40,49 +38,63 @@ enum SMBServerError: LocalizedError {
         case .alreadyRunning: "Share is already running."
         case .bindFailed: "Could not open an SMB port on this device."
         case .noWiFi: "Connect to Wi-Fi, then tap Start."
-        case .invalidConfig: "Username and password are required."
+        case .invalidConfig: "Username, password, and share names must be valid."
         }
     }
 }
 
-final class SMBServer: @unchecked Sendable {
-    static let shareName = "inas"
+final class SMBServer: SMBServing, @unchecked Sendable {
+    static let shareName = ShareName.builtin
     private let queue = DispatchQueue(label: "app.inas.smb")
+    var ports: [UInt16]
 
-    func start(root: URL, username: String, password: String, hostname: String) throws -> UInt16 {
+    init(ports: [UInt16] = [445, 4455]) {
+        self.ports = ports.isEmpty ? [445, 4455] : ports
+    }
+
+    func start(shares: [LiveShare], username: String, password: String, hostname: String, bindIP: String) throws -> UInt16 {
         try queue.sync {
-            var lastError: Int32 = 0
-            let result: UInt16? = root.path.withCString { rootPtr in
-                SMBServer.shareName.withCString { sharePtr in
-                    username.withCString { userPtr in
-                        password.withCString { passPtr in
-                            hostname.withCString { hostPtr in
-                                for port: UInt16 in [445, 4455] {
+            guard !shares.isEmpty, shares.count <= Int(INAS_MAX_SHARES) else {
+                throw SMBServerError.invalidConfig
+            }
+            let names = shares.map(\.name)
+            let roots = shares.map { $0.root.path }
+            let tryPorts = ports
+            let rc: Int32 = withSharePointers(names: names, roots: roots) { table, count in
+                username.withCString { userPtr in
+                    password.withCString { passPtr in
+                        hostname.withCString { hostPtr in
+                            bindIP.withCString { bindPtr in
+                                tryPorts.withUnsafeBufferPointer { portBuf in
                                     var config = inas_smb_config(
-                                        root_path: rootPtr,
-                                        share_name: sharePtr,
                                         username: userPtr,
                                         password: passPtr,
                                         hostname: hostPtr,
-                                        port: port
+                                        bind_ip: bindPtr,
+                                        port: tryPorts[0],
+                                        try_ports: portBuf.baseAddress,
+                                        try_port_count: Int32(tryPorts.count),
+                                        share_count: Int32(count),
+                                        shares: table
                                     )
-                                    let rc = inas_smb_start(&config)
-                                    if rc == 0 {
-                                        let bound = UInt16(inas_smb_bound_port())
-                                        return bound == 0 ? port : bound
-                                    }
-                                    lastError = rc
+                                    return inas_smb_start(&config)
                                 }
-                                return nil
                             }
                         }
                     }
                 }
             }
-            if let result {
-                return result
+            if rc == 0 {
+                let bound = UInt16(inas_smb_bound_port())
+                return bound == 0 ? tryPorts[0] : bound
             }
-            throw lastError == -Int32(EALREADY) ? SMBServerError.alreadyRunning : SMBServerError.bindFailed
+            if rc == -Int32(EALREADY) {
+                throw SMBServerError.alreadyRunning
+            }
+            if rc == -Int32(EINVAL) || rc == -Int32(ENAMETOOLONG) {
+                throw SMBServerError.invalidConfig
+            }
+            throw SMBServerError.bindFailed
         }
     }
 
@@ -95,4 +107,19 @@ final class SMBServer: @unchecked Sendable {
     var isRunning: Bool { inas_smb_is_running() != 0 }
     var clientCount: Int { Int(inas_smb_client_count()) }
     var bytesTransferred: UInt64 { inas_smb_bytes_transferred() }
+
+    private func withSharePointers<T>(names: [String], roots: [String], body: (UnsafePointer<inas_smb_share>, Int) -> T) -> T {
+        var nameCStrings: [UnsafeMutablePointer<CChar>] = names.map { strdup($0)! }
+        var rootCStrings: [UnsafeMutablePointer<CChar>] = roots.map { strdup($0)! }
+        defer {
+            nameCStrings.forEach { free($0) }
+            rootCStrings.forEach { free($0) }
+        }
+        var table = zip(nameCStrings, rootCStrings).map { name, root in
+            inas_smb_share(name: name, root_path: root)
+        }
+        return table.withUnsafeBufferPointer { buf in
+            body(buf.baseAddress!, names.count)
+        }
+    }
 }
