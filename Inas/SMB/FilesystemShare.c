@@ -98,6 +98,10 @@ struct inas_state {
         uint64_t id_counter;
         atomic_int clients;
         atomic_uint_fast64_t bytes;
+        atomic_uint_fast64_t bytes_read;
+        atomic_uint_fast64_t bytes_written;
+        atomic_uint_fast64_t peak_clients;
+        atomic_int active_transfers;
         struct smb2_server server;
         inas_auth_slot auth[INAS_AUTH_PEERS];
         inas_auth_global auth_global;
@@ -384,12 +388,17 @@ static int authorize_user(struct smb2_server *srvr, struct smb2_context *smb2, c
 static int session_established(struct smb2_server *srvr, struct smb2_context *smb2)
 {
         struct inas_state *fs = fs_state(srvr);
-        atomic_fetch_add(&fs->clients, 1);
+        int n = atomic_fetch_add(&fs->clients, 1) + 1;
         pthread_mutex_lock(&fs->lock);
         time_t now = time(NULL);
         inas_auth_on_success(inas_auth_lookup(fs->auth, INAS_AUTH_PEERS, peer_ipv4(smb2), now));
         inas_auth_global_record_success(&fs->auth_global);
         pthread_mutex_unlock(&fs->lock);
+        uint64_t peak = atomic_load(&fs->peak_clients);
+        while ((uint64_t)n > peak &&
+               !atomic_compare_exchange_weak(&fs->peak_clients, &peak, (uint64_t)n)) {
+                /* peak refreshed by the CAS; loop until it exceeds or wins */
+        }
         return 0;
 }
 
@@ -812,8 +821,10 @@ static int read_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 pthread_mutex_unlock(&fs->lock);
                 return -ENOMEM;
         }
+        atomic_fetch_add(&fs->active_transfers, 1);
         ssize_t n = pread(h->fd, buf, len, (off_t)req->offset);
         pthread_mutex_unlock(&fs->lock);
+        atomic_fetch_sub(&fs->active_transfers, 1);
         if (n < 0) {
                 free(buf);
                 return -errno;
@@ -829,6 +840,7 @@ static int read_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         rep->data_length = (uint32_t)n;
         rep->data_remaining = 0;
         atomic_fetch_add(&fs->bytes, (uint64_t)n);
+        atomic_fetch_add(&fs->bytes_read, (uint64_t)n);
         return 0;
 }
 
@@ -862,14 +874,17 @@ static int write_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 pthread_mutex_unlock(&fs->lock);
                 return -EINVAL;
         }
+        atomic_fetch_add(&fs->active_transfers, 1);
         ssize_t n = pwrite(h->fd, req->buf, req->length, (off_t)req->offset);
         pthread_mutex_unlock(&fs->lock);
+        atomic_fetch_sub(&fs->active_transfers, 1);
         if (n < 0) {
                 return -errno;
         }
         rep->count = (uint32_t)n;
         rep->remaining = 0;
         atomic_fetch_add(&fs->bytes, (uint64_t)n);
+        atomic_fetch_add(&fs->bytes_written, (uint64_t)n);
         return 0;
 }
 
@@ -1715,6 +1730,10 @@ int inas_smb_start(const inas_smb_config *config)
         g.id_counter = 1;
         atomic_store(&g.clients, 0);
         atomic_store(&g.bytes, 0);
+        atomic_store(&g.bytes_read, 0);
+        atomic_store(&g.bytes_written, 0);
+        atomic_store(&g.peak_clients, 0);
+        atomic_store(&g.active_transfers, 0);
         memset(g.auth, 0, sizeof(g.auth));
         memset(&g.auth_global, 0, sizeof(g.auth_global));
         for (int i = 0; i < INAS_MAX_SHARES; i++) {
@@ -1891,6 +1910,26 @@ int inas_smb_client_count(void)
 uint64_t inas_smb_bytes_transferred(void)
 {
         return atomic_load(&g.bytes);
+}
+
+int inas_smb_active_transfers(void)
+{
+        return atomic_load(&g.active_transfers);
+}
+
+uint64_t inas_smb_bytes_read(void)
+{
+        return atomic_load(&g.bytes_read);
+}
+
+uint64_t inas_smb_bytes_written(void)
+{
+        return atomic_load(&g.bytes_written);
+}
+
+int inas_smb_peak_clients(void)
+{
+        return (int)atomic_load(&g.peak_clients);
 }
 
 int inas_smb_auth_stats(int *peer_count, int *locked_count)

@@ -43,6 +43,8 @@ final class ShareController {
     var showPassword = false
     var clientCount = 0
     var bytesTransferred: UInt64 = 0
+    var stats = ShareStats()
+    private var lastStatsTotal: UInt64 = 0
 
     init(
         store: CredentialStore = CredentialStore(),
@@ -221,6 +223,10 @@ final class ShareController {
             showPassword = false
         }
         endpoint = nil
+        clientCount = 0
+        bytesTransferred = 0
+        lastStatsTotal = 0
+        stats = ShareStats()
         state = .stopped
         if notify {
             background.notifyStoppedBySystem()
@@ -308,6 +314,7 @@ final class ShareController {
         #else
         let simNoWatchdog = false
         #endif
+        lastStatsTotal = 0
         statsTimer?.invalidate()
         statsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -318,6 +325,19 @@ final class ShareController {
                 }
                 self.clientCount = self.server.clientCount
                 self.bytesTransferred = self.server.bytesTransferred
+                let total = self.bytesTransferred
+                // A smaller total than the previous tick means the server
+                // restarted underneath us; report no rate for that tick.
+                let delta = total >= self.lastStatsTotal ? total - self.lastStatsTotal : 0
+                self.lastStatsTotal = total
+                self.stats = ShareStats(
+                    connections: self.clientCount,
+                    peakClients: self.server.peakClients,
+                    activeTransfers: self.server.activeTransfers,
+                    bytesRead: self.server.bytesRead,
+                    bytesWritten: self.server.bytesWritten,
+                    bytesPerSecond: Double(delta)
+                )
             }
         }
     }

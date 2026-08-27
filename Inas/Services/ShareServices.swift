@@ -16,6 +16,10 @@ protocol SMBServing: AnyObject {
     func stop()
     var clientCount: Int { get }
     var bytesTransferred: UInt64 { get }
+    var activeTransfers: Int { get }
+    var bytesRead: UInt64 { get }
+    var bytesWritten: UInt64 { get }
+    var peakClients: Int { get }
 }
 
 protocol BonjourAdvertising: AnyObject {

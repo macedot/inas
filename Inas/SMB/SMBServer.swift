@@ -115,6 +115,10 @@ final class SMBServer: SMBServing, @unchecked Sendable {
     var isRunning: Bool { inas_smb_is_running() != 0 }
     var clientCount: Int { Int(inas_smb_client_count()) }
     var bytesTransferred: UInt64 { inas_smb_bytes_transferred() }
+    var activeTransfers: Int { Int(inas_smb_active_transfers()) }
+    var bytesRead: UInt64 { inas_smb_bytes_read() }
+    var bytesWritten: UInt64 { inas_smb_bytes_written() }
+    var peakClients: Int { Int(inas_smb_peak_clients()) }
 
     private func withSharePointers<T>(names: [String], roots: [String], body: (UnsafePointer<inas_smb_share>, Int) -> T) -> T {
         var nameCStrings: [UnsafeMutablePointer<CChar>] = names.map { strdup($0)! }

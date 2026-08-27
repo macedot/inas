@@ -41,6 +41,14 @@ int inas_smb_client_count(void);
 
 uint64_t inas_smb_bytes_transferred(void);
 
+int inas_smb_active_transfers(void);
+
+uint64_t inas_smb_bytes_read(void);
+
+uint64_t inas_smb_bytes_written(void);
+
+int inas_smb_peak_clients(void);
+
 int inas_smb_auth_stats(int *peer_count, int *locked_count);
 
 int inas_smb_auth_global_locked(void);

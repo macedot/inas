@@ -80,6 +80,31 @@ final class SMBLoopbackTests: XCTestCase {
         )
     }
 
+    func testTransferStatsCounters() throws {
+        let port = try startServer()
+        XCTAssertEqual(inas_smb_bytes_read(), 0)
+        XCTAssertEqual(inas_smb_bytes_written(), 0)
+        XCTAssertEqual(inas_smb_peak_clients(), 0)
+        XCTAssertEqual(inas_smb_active_transfers(), 0)
+        var err = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            inas_smb_client_roundtrip("127.0.0.1", port, "inas", "correct1", "inas", &err, Int32(err.count)),
+            0,
+            String(cString: err)
+        )
+        // The roundtrip writes and reads back a file; both directions count.
+        XCTAssertGreaterThan(inas_smb_bytes_written(), 0, "file write must count")
+        XCTAssertGreaterThan(inas_smb_bytes_read(), 0, "file read must count")
+        XCTAssertGreaterThanOrEqual(inas_smb_peak_clients(), 1, "session must register a peak")
+        // No transfer is in flight once the probe disconnected.
+        XCTAssertEqual(inas_smb_active_transfers(), 0)
+        // The server thread tears the context down asynchronously; wait briefly.
+        for _ in 0..<100 where inas_smb_client_count() != 0 {
+            usleep(20000)
+        }
+        XCTAssertEqual(inas_smb_client_count(), 0)
+    }
+
     func testThrottleLocksPeerAfterElevenFailures() throws {
         let port = try startServer()
         var err = [CChar](repeating: 0, count: 256)

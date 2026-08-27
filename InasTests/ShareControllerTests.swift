@@ -17,6 +17,10 @@ private final class MockServer: SMBServing, @unchecked Sendable {
     private(set) var stopped = false
     var clientCount = 0
     var bytesTransferred: UInt64 = 0
+    var activeTransfers = 0
+    var bytesRead: UInt64 = 0
+    var bytesWritten: UInt64 = 0
+    var peakClients = 0
 
     func start(shares: [LiveShare], username: String, password: String, hostname: String, bindIP: String) throws -> UInt16 {
         if blockStart {

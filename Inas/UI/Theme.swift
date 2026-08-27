@@ -19,3 +19,31 @@ enum InasTheme {
         .system(.body, design: .monospaced)
     }
 }
+
+/// Shared folded-card header: icon, small caption title, and a one-line
+/// mono summary. Used by every DisclosureGroup card so they read as one
+/// family (Status, Connection, Settings sections).
+struct CardHeader: View {
+    let icon: String
+    let title: String
+    let summary: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Text(summary)
+                    .font(InasTheme.mono)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+    }
+}

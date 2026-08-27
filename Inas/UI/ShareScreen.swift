@@ -28,17 +28,24 @@ struct ShareScreen: View {
                 if controller.state.isSharing {
                     sessionCard
                         .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .padding(.bottom, 12)
+                    statusCard
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                         .padding(.bottom, 24)
                 }
-                Text("v\(appVersion)")
-                    .font(.system(.caption, design: .rounded).weight(.semibold))
-                    .foregroundStyle(.tertiary)
-                    .accessibilityLabel("Version \(appVersion)")
             }
             .padding(.horizontal, 24)
             .frame(maxWidth: 560)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(background.ignoresSafeArea())
+            .overlay(alignment: .topLeading) {
+                Text("v\(appVersion)")
+                    .font(.system(.caption, design: .rounded).weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 6)
+                    .padding(.leading, 24)
+                    .accessibilityLabel("Version \(appVersion)")
+            }
             .navigationTitle("iNAS")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -63,22 +70,85 @@ struct ShareScreen: View {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.1"
     }
 
+    @State private var connectionExpanded = true
+
     private var sessionCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            sessionRow(label: "Mac", value: controller.connectionURL, copy: controller.connectionURL)
-            if let windows = controller.endpoint?.windowsHint {
-                sessionRow(label: "Windows", value: windows, copy: windows)
+        DisclosureGroup(isExpanded: $connectionExpanded) {
+            VStack(alignment: .leading, spacing: 14) {
+                sessionRow(label: "Mac", value: controller.connectionURL, copy: controller.connectionURL)
+                if let windows = controller.endpoint?.windowsHint {
+                    sessionRow(label: "Windows", value: windows, copy: windows)
+                }
+                if let name = controller.endpoint?.windowsNameHint {
+                    sessionRow(label: "Windows name", value: name, copy: name)
+                }
+                sessionRow(label: "User", value: controller.credentials.username, copy: controller.credentials.username)
+                sessionRow(label: "Password", value: controller.credentials.password, copy: controller.credentials.password)
             }
-            if let name = controller.endpoint?.windowsNameHint {
-                sessionRow(label: "Windows name", value: name, copy: name)
-            }
-            sessionRow(label: "User", value: controller.credentials.username, copy: controller.credentials.username)
-            sessionRow(label: "Password", value: controller.credentials.password, copy: controller.credentials.password)
+            .padding(.top, 14)
+        } label: {
+            CardHeader(icon: "link", title: "Connection", summary: controller.connectionURL)
         }
         .padding(18)
         .background(cardBackground)
+        .animation(.easeInOut(duration: 0.2), value: connectionExpanded)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Share credentials")
+        .accessibilityLabel("Connection, \(controller.connectionURL)")
+    }
+
+    @State private var statusExpanded = false
+
+    private var statusCard: some View {
+        DisclosureGroup(isExpanded: $statusExpanded) {
+            VStack(alignment: .leading, spacing: 12) {
+                statusRow(
+                    "Connections",
+                    "\(controller.stats.connections) now · \(controller.stats.peakClients) peak"
+                )
+                statusRow(
+                    "Active transfers",
+                    "\(controller.stats.activeTransfers)"
+                )
+                statusRow(
+                    "Data read",
+                    ShareStats.byteText(controller.stats.bytesRead)
+                )
+                statusRow(
+                    "Data written",
+                    ShareStats.byteText(controller.stats.bytesWritten)
+                )
+                statusRow(
+                    "Speed",
+                    ShareStats.speedText(controller.stats.bytesPerSecond)
+                )
+            }
+            .padding(.top, 12)
+        } label: {
+            CardHeader(
+                icon: controller.stats.activeTransfers > 0 ? "arrow.up.arrow.down" : "chart.bar",
+                title: "Status",
+                summary: controller.stats.summary
+            )
+        }
+        .padding(18)
+        .background(cardBackground)
+        .animation(.easeInOut(duration: 0.2), value: statusExpanded)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Share status, \(controller.stats.summary)")
+    }
+
+    private func statusRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text(value)
+                .font(InasTheme.mono)
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+        }
+        .accessibilityElement(children: .combine)
     }
 
     private func sessionRow(label: String, value: String, copy: String, secret: Bool = false) -> some View {
