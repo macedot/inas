@@ -23,12 +23,50 @@ final class WindowsDiscovery: WindowsDiscovering {
     private let queue = DispatchQueue(label: "app.inas.discovery")
     private var session: Session?
 
+    /// Per-peer token bucket for UDP Probe/Resolve and LLMNR replies.
+    /// 5 tokens/s, burst of 3, at most 32 tracked addresses.
+    struct ReplyBudget {
+        struct Bucket {
+            var tokens: Double
+            var lastRefill: Date
+        }
+
+        var table: [String: Bucket] = [:]
+        let rate = 5.0
+        let burst = 3.0
+        let maxIPs = 32
+
+        mutating func allow(ip: String, now: Date) -> Bool {
+            prune(reserving: ip)
+            var bucket = table[ip] ?? Bucket(tokens: burst, lastRefill: now)
+            let elapsed = now.timeIntervalSince(bucket.lastRefill)
+            bucket.tokens = min(burst, bucket.tokens + elapsed * rate)
+            bucket.lastRefill = now
+            if bucket.tokens >= 1 {
+                bucket.tokens -= 1
+                table[ip] = bucket
+                return true
+            }
+            table[ip] = bucket
+            return false
+        }
+
+        mutating func prune(reserving ip: String) {
+            if table[ip] != nil { return }
+            guard table.count >= maxIPs else { return }
+            if let oldest = table.min(by: { $0.value.lastRefill < $1.value.lastRefill })?.key {
+                table.removeValue(forKey: oldest)
+            }
+        }
+    }
+
     private final class Session {
         let advertisedIP: String
         let advertisedPort: UInt16
         let instanceId: String
         let endpointUUID: UUID
         var messageNumber: UInt32 = 0
+        var replyBudget = ReplyBudget()
         var wsdFD: Int32 = -1
         var llmnrFD: Int32 = -1
         var wsdSource: DispatchSourceRead?
@@ -177,15 +215,16 @@ final class WindowsDiscovery: WindowsDiscovering {
     private func handleWSD(_ data: Data, from ip: String, port: UInt16, session: Session) {
         guard isCurrent(session), let xml = String(data: data, encoding: .utf8) else { return }
         let action = Self.wsdAction(xml)
-        if action.hasSuffix("/Probe") && !action.hasSuffix("/ProbeMatches") {
-            let relates = Self.uuidFromXML(xml, tag: "MessageID") ?? "urn:uuid:\(UUID().uuidString.lowercased())"
+        let isProbe = action.hasSuffix("/Probe") && !action.hasSuffix("/ProbeMatches")
+        let isResolve = action.hasSuffix("/Resolve") && !action.hasSuffix("/ResolveMatches")
+        guard isProbe || isResolve else { return }
+        guard session.replyBudget.allow(ip: ip, now: Date()) else { return }
+        let relates = Self.uuidFromXML(xml, tag: "MessageID") ?? "urn:uuid:\(UUID().uuidString.lowercased())"
+        if isProbe {
             sendWSDUnicast(wsdProbeMatch(relatesTo: relates, session: session), to: ip, port: port, session: session)
             return
         }
-        if action.hasSuffix("/Resolve") && !action.hasSuffix("/ResolveMatches") {
-            let relates = Self.uuidFromXML(xml, tag: "MessageID") ?? "urn:uuid:\(UUID().uuidString.lowercased())"
-            sendWSDUnicast(wsdResolveMatch(relatesTo: relates, session: session), to: ip, port: port, session: session)
-        }
+        sendWSDUnicast(wsdResolveMatch(relatesTo: relates, session: session), to: ip, port: port, session: session)
     }
 
     private func sendHelloBurst(_ session: Session) {
@@ -487,6 +526,7 @@ final class WindowsDiscovery: WindowsDiscovering {
             let query = Data(buf.prefix(Int(n)))
             guard let reply = Self.llmnrReply(for: query, hostName: Self.hostName, ipv4: session.advertisedIP) else { continue }
             let ip = String(cString: srcIP)
+            guard session.replyBudget.allow(ip: ip, now: Date()) else { continue }
             reply.withUnsafeBytes { raw in
                 guard let base = raw.baseAddress else { return }
                 ip.withCString { ipPtr in

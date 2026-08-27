@@ -3,10 +3,9 @@
 Findings from a full codebase review (security, tests, refactors) plus the
 agreed remediation plan.
 
-**Status:** Phases 0–7 are in the tree, plus PLAN-1 addendum (fd-leak,
-share-name charset, loopback 3.x session / CRUD / throttle / handle
-exhaustion / write bounds). Discovery uses a session object; vendor
-patches `0001`–`0007`. clang-format on owned C files is a hard CI check.
+**Status:** Phases 0–7 are in the tree, plus PLAN-1 and PLAN-2 addenda.
+Discovery uses a session object; vendor patches `0001`–`0008`.
+clang-format on owned C files is a hard CI check.
 
 Decisions confirmed during planning:
 

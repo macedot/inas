@@ -45,6 +45,7 @@ static int is_safe_component(const char *comp, size_t len)
         return 1;
 }
 
+#if DEBUG
 static int realpath_prefix_ok(const char *root_real, const char *candidate)
 {
         size_t root_len = strlen(root_real);
@@ -60,6 +61,7 @@ static int realpath_prefix_ok(const char *root_real, const char *candidate)
         }
         return candidate[root_len] == '/';
 }
+#endif /* DEBUG */
 
 void inas_path_release(inas_path *p)
 {
@@ -149,6 +151,7 @@ int inas_path_resolve_at(int rootfd, const char *smb_name, inas_path *out)
         return 0;
 }
 
+#if DEBUG
 int inas_path_resolve(const char *root, const char *smb_name, char *out, size_t out_len)
 {
         char root_real[PATH_MAX];
@@ -256,3 +259,4 @@ int inas_path_resolve(const char *root, const char *smb_name, char *out, size_t 
         memcpy(out, tmp, strlen(tmp) + 1);
         return 0;
 }
+#endif /* DEBUG */

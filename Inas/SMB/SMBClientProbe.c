@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 
 #if DEBUG
 
@@ -361,6 +362,92 @@ out:
         smb2_disconnect_share(smb2);
         smb2_destroy_context(smb2);
         return rc;
+}
+
+int inas_smb_client_plaintext_after_session(const char *host, uint16_t port, const char *user,
+                                            const char *password, const char *share, char *err,
+                                            int errlen)
+{
+        struct smb2_context *smb2;
+        struct smb2_create_request req;
+        struct smb2_pdu *pdu;
+        struct raw_status rs;
+        struct pollfd pfd;
+        int i;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+        /* Drop sealing so the next PDU goes out as a bare SMB2 header. */
+        smb2_set_seal(smb2, 0);
+        smb2_set_sign(smb2, 0);
+
+        memset(&req, 0, sizeof(req));
+        req.requested_oplock_level = SMB2_OPLOCK_LEVEL_NONE;
+        req.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION;
+        req.desired_access = SMB2_FILE_READ_ATTRIBUTES;
+        req.share_access = SMB2_FILE_SHARE_READ | SMB2_FILE_SHARE_WRITE;
+        req.create_disposition = SMB2_FILE_OPEN;
+        req.name = "hello.txt";
+
+        memset(&rs, 0, sizeof(rs));
+        pdu = smb2_cmd_create_async(smb2, &req, raw_cb, &rs);
+        if (!pdu) {
+                set_err(err, errlen, smb2, "plaintext create encode failed");
+                smb2_destroy_context(smb2);
+                return -1;
+        }
+        smb2_queue_pdu(smb2, pdu);
+
+        pfd.fd = smb2_get_fd(smb2);
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 2000) < 1 || smb2_service(smb2, POLLOUT) < 0) {
+                /* Write failed because the server already dropped us. */
+                set_err(err, errlen, NULL, NULL);
+                smb2_destroy_context(smb2);
+                return 0;
+        }
+
+        /* Do not parse inbound PDUs: sealing is off on this context, so a
+         * transform reply would crash the decoder. The reject we want is
+         * the server hanging up. */
+        for (i = 0; i < 20; i++) {
+                char peek;
+                ssize_t n;
+
+                pfd.fd = smb2_get_fd(smb2);
+                if (pfd.fd < 0) {
+                        set_err(err, errlen, NULL, NULL);
+                        smb2_destroy_context(smb2);
+                        return 0;
+                }
+                pfd.events = POLLIN | POLLHUP | POLLERR;
+                pfd.revents = 0;
+                if (poll(&pfd, 1, 100) < 1) {
+                        continue;
+                }
+                if (pfd.revents & (POLLHUP | POLLERR)) {
+                        set_err(err, errlen, NULL, NULL);
+                        smb2_destroy_context(smb2);
+                        return 0;
+                }
+                n = recv(pfd.fd, &peek, 1, MSG_PEEK);
+                if (n <= 0) {
+                        set_err(err, errlen, NULL, NULL);
+                        smb2_destroy_context(smb2);
+                        return 0;
+                }
+                set_err(err, errlen, NULL,
+                        "server replied to plaintext CREATE instead of dropping");
+                smb2_destroy_context(smb2);
+                return -1;
+        }
+
+        set_err(err, errlen, NULL, "server kept the connection after plaintext CREATE");
+        smb2_destroy_context(smb2);
+        return -1;
 }
 
 #endif /* DEBUG */

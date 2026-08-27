@@ -43,6 +43,8 @@ uint64_t inas_smb_bytes_transferred(void);
 
 int inas_smb_auth_stats(int *peer_count, int *locked_count);
 
+int inas_smb_auth_global_locked(void);
+
 #ifdef __cplusplus
 }
 #endif

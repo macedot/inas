@@ -1,6 +1,14 @@
 /* Copyright (C) 2026 Thiago Macedo
  * SPDX-License-Identifier: AGPL-3.0-or-later */
 
+#define __STDC_WANT_LIB_EXT1__ 1
+
+/*
+ * Path operations use dirfd + leaf + *at/O_NOFOLLOW (inas_path_resolve_at).
+ * Never open, stat, rename, or unlink a user-supplied path by absolute
+ * string — that reintroduces the TOCTOU this sandbox closed.
+ */
+
 #include "FilesystemShare.h"
 #include "PathSandbox.h"
 #include "GlobMatch.h"
@@ -26,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -73,6 +82,7 @@ struct inas_state {
         atomic_uint_fast64_t bytes;
         struct smb2_server server;
         inas_auth_slot auth[INAS_AUTH_PEERS];
+        inas_auth_global auth_global;
 };
 
 static struct inas_state g;
@@ -235,7 +245,10 @@ static int share_from_tree_path(const uint16_t *path, uint16_t path_length, char
                 free((void *)utf8);
                 return -1;
         }
-        snprintf(out, out_len, "%s", name);
+        if (snprintf(out, out_len, "%s", name) >= (int)out_len) {
+                free((void *)utf8);
+                return -1;
+        }
         free((void *)utf8);
         return 0;
 }
@@ -254,6 +267,9 @@ static uint32_t peer_ipv4(struct smb2_context *smb2)
         return addr.sin_addr.s_addr;
 }
 
+/* Single-user appliance: only DOMAIN\user is stripped; user@REALM is
+ * not rewritten. All handlers share g.lock; finer locking is deferred
+ * until a load profile shows it matters. */
 static int authorize_user(struct smb2_server *srvr, struct smb2_context *smb2, const char *user,
                           const char *domain, const char *workstation)
 {
@@ -261,9 +277,17 @@ static int authorize_user(struct smb2_server *srvr, struct smb2_context *smb2, c
         (void)domain;
         (void)workstation;
         pthread_mutex_lock(&fs->lock);
+        time_t now = time(NULL);
         uint32_t ip = peer_ipv4(smb2);
-        inas_auth_slot *slot = inas_auth_lookup(fs->auth, INAS_AUTH_PEERS, ip, time(NULL));
-        if (inas_auth_is_locked(slot, time(NULL))) {
+        if (inas_auth_global_locked(&fs->auth_global, now)) {
+                pthread_mutex_unlock(&fs->lock);
+                return -1;
+        }
+        inas_auth_slot *slot = inas_auth_lookup(fs->auth, INAS_AUTH_PEERS, ip, now);
+        if (inas_auth_is_locked(slot, now)) {
+                /* Locked peers still count toward the global window so a
+                 * single chatty address can trip the LAN-wide backoff. */
+                inas_auth_global_record_failure(&fs->auth_global, now);
                 pthread_mutex_unlock(&fs->lock);
                 return -1;
         }
@@ -286,8 +310,9 @@ static int session_established(struct smb2_server *srvr, struct smb2_context *sm
         struct inas_state *fs = fs_state(srvr);
         atomic_fetch_add(&fs->clients, 1);
         pthread_mutex_lock(&fs->lock);
-        inas_auth_on_success(
-            inas_auth_lookup(fs->auth, INAS_AUTH_PEERS, peer_ipv4(smb2), time(NULL)));
+        time_t now = time(NULL);
+        inas_auth_on_success(inas_auth_lookup(fs->auth, INAS_AUTH_PEERS, peer_ipv4(smb2), now));
+        inas_auth_global_record_success(&fs->auth_global);
         pthread_mutex_unlock(&fs->lock);
         return 0;
 }
@@ -296,8 +321,10 @@ static int auth_failed(struct smb2_server *srvr, struct smb2_context *smb2)
 {
         struct inas_state *fs = fs_state(srvr);
         pthread_mutex_lock(&fs->lock);
-        inas_auth_on_failure(
-            inas_auth_lookup(fs->auth, INAS_AUTH_PEERS, peer_ipv4(smb2), time(NULL)), time(NULL));
+        time_t now = time(NULL);
+        inas_auth_on_failure(inas_auth_lookup(fs->auth, INAS_AUTH_PEERS, peer_ipv4(smb2), now),
+                             now);
+        inas_auth_global_record_failure(&fs->auth_global, now);
         pthread_mutex_unlock(&fs->lock);
         return 0;
 }
@@ -1265,6 +1292,7 @@ int inas_smb_start(const inas_smb_config *config)
         atomic_store(&g.clients, 0);
         atomic_store(&g.bytes, 0);
         memset(g.auth, 0, sizeof(g.auth));
+        memset(&g.auth_global, 0, sizeof(g.auth_global));
         for (int i = 0; i < INAS_MAX_SHARES; i++) {
                 g.shares[i].rootfd = -1;
         }
@@ -1299,7 +1327,7 @@ int inas_smb_start(const inas_smb_config *config)
                 g.share_count++;
         }
         memset(g.user, 0, sizeof(g.user));
-        memset(g.password, 0, sizeof(g.password));
+        (void)memset_s(g.password, sizeof(g.password), 0, sizeof(g.password));
         if (!config->username[0] || !config->password[0]) {
                 close_share_fds();
                 pthread_mutex_unlock(&g.lock);
@@ -1308,7 +1336,7 @@ int inas_smb_start(const inas_smb_config *config)
         if (snprintf(g.user, sizeof(g.user), "%s", config->username) >= (int)sizeof(g.user) ||
             snprintf(g.password, sizeof(g.password), "%s", config->password) >=
                 (int)sizeof(g.password)) {
-                memset(g.password, 0, sizeof(g.password));
+                (void)memset_s(g.password, sizeof(g.password), 0, sizeof(g.password));
                 close_share_fds();
                 pthread_mutex_unlock(&g.lock);
                 return -ENAMETOOLONG;
@@ -1414,7 +1442,7 @@ void inas_smb_stop(void)
         }
         close_share_fds();
         g.share_count = 0;
-        memset(g.password, 0, sizeof(g.password));
+        (void)memset_s(g.password, sizeof(g.password), 0, sizeof(g.password));
         pthread_mutex_unlock(&g.lock);
 }
 
@@ -1463,9 +1491,20 @@ int inas_smb_auth_stats(int *peer_count, int *locked_count)
         return 0;
 }
 
+int inas_smb_auth_global_locked(void)
+{
+        time_t now = time(NULL);
+        int locked;
+        pthread_mutex_lock(&g.lock);
+        locked = inas_auth_global_locked(&g.auth_global, now);
+        pthread_mutex_unlock(&g.lock);
+        return locked;
+}
+
 __attribute__((constructor)) static void inas_init(void)
 {
         pthread_mutex_init(&g.lock, NULL);
+        (void)mlock(g.password, sizeof(g.password));
         g.server.fd = -1;
         for (int i = 0; i < INAS_MAX_SHARES; i++) {
                 g.shares[i].rootfd = -1;

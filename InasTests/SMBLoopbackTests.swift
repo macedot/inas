@@ -102,6 +102,53 @@ final class SMBLoopbackTests: XCTestCase {
             0,
             "locked peer must be rejected"
         )
+        XCTAssertEqual(inas_smb_auth_global_locked(), 0)
+    }
+
+    func testGlobalThrottleLocksAfterOneHundredOneFailures() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        var negotiated: UInt16 = 0
+        for _ in 0..<101 {
+            XCTAssertNotEqual(
+                inas_smb_client_connect("127.0.0.1", port, "inas", "wrong-password", "inas", 0, &negotiated, &err, Int32(err.count)),
+                0
+            )
+        }
+        XCTAssertEqual(inas_smb_auth_global_locked(), 1)
+        XCTAssertNotEqual(
+            inas_smb_client_connect("127.0.0.1", port, "inas", "correct1", "inas", 0, &negotiated, &err, Int32(err.count)),
+            0,
+            "global backoff must reject even the correct password"
+        )
+    }
+
+    func testRejectsPlaintextAfterSealedSession() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            inas_smb_client_plaintext_after_session("127.0.0.1", port, "inas", "correct1", "inas", &err, Int32(err.count)),
+            0,
+            String(cString: err)
+        )
+    }
+
+    func testRejectsOverlongShareName() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        var negotiated: UInt16 = 0
+        let longName = String(repeating: "a", count: 200)
+        XCTAssertNotEqual(
+            inas_smb_client_connect("127.0.0.1", port, "inas", "correct1", longName, 0, &negotiated, &err, Int32(err.count)),
+            0,
+            "tree-connect to a 200-byte share name must fail"
+        )
+        XCTAssertEqual(inas_smb_is_running(), 1, "failed TREE_CONNECT must not take the listener down")
+        XCTAssertEqual(
+            inas_smb_client_connect("127.0.0.1", port, "inas", "correct1", "inas", 0, &negotiated, &err, Int32(err.count)),
+            0,
+            String(cString: err)
+        )
     }
 
     func testHandleExhaustionAtTableSize() throws {

@@ -15,6 +15,11 @@ extern "C" {
 #define INAS_AUTH_LOCK_SEC 300
 #define INAS_AUTH_PEERS 64
 
+#define INAS_AUTH_GLOBAL_WINDOW_SEC 300
+#define INAS_AUTH_GLOBAL_LIMIT 100
+#define INAS_AUTH_GLOBAL_BACKOFF_SEC 60
+#define INAS_AUTH_GLOBAL_BACKOFF_CAP 900 /* 15 min */
+
 typedef struct inas_auth_slot {
         uint32_t ip;
         unsigned fails;
@@ -22,6 +27,13 @@ typedef struct inas_auth_slot {
         time_t locked_until;
         time_t last_used;
 } inas_auth_slot;
+
+typedef struct inas_auth_global {
+        unsigned fails;
+        time_t window_start;
+        time_t backoff_until;
+        unsigned streak; /* doubles backoff on each re-trigger */
+} inas_auth_global;
 
 int inas_auth_is_locked(const inas_auth_slot *slot, time_t now);
 
@@ -31,6 +43,10 @@ int inas_auth_on_failure(inas_auth_slot *slot, time_t now);
 void inas_auth_on_success(inas_auth_slot *slot);
 
 inas_auth_slot *inas_auth_lookup(inas_auth_slot *table, int n, uint32_t ip, time_t now);
+
+int inas_auth_global_locked(const inas_auth_global *g, time_t now);
+void inas_auth_global_record_failure(inas_auth_global *g, time_t now);
+void inas_auth_global_record_success(inas_auth_global *g);
 
 #ifdef __cplusplus
 }

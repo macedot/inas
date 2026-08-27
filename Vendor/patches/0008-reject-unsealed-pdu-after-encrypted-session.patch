@@ -1,0 +1,55 @@
+diff --git a/Vendor/libsmb2/include/libsmb2-private.h b/Vendor/libsmb2/include/libsmb2-private.h
+index 9e1befd..d918a6c 100644
+--- a/Vendor/libsmb2/include/libsmb2-private.h
++++ b/Vendor/libsmb2/include/libsmb2-private.h
+@@ -226,6 +226,10 @@ struct smb2_context {
+         uint8_t seal:1;
+         int8_t seal_requested;
+         uint8_t sign:1;
++        /* Set when the final SESSION_SETUP success reply is queued. A
++         * sealing server then rejects any later PDU that is not wrapped
++         * in a transform header (plaintext downgrade). */
++        uint8_t session_up:1;
+         uint8_t signing_key[SMB2_KEY_SIZE];
+         uint8_t serverin_key[SMB2_KEY_SIZE];
+         uint8_t serverout_key[SMB2_KEY_SIZE];
+diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Vendor/libsmb2/lib/libsmb2.c
+index 0115f48..986de51 100644
+--- a/Vendor/libsmb2/lib/libsmb2.c
++++ b/Vendor/libsmb2/lib/libsmb2.c
+@@ -192,6 +192,7 @@ smb2_close_context(struct smb2_context *smb2)
+                 smb2->session_key = NULL;
+         }
+         smb2->session_key_size = 0;
++        smb2->session_up = 0;
+ }
+ 
+ static int
+@@ -4324,6 +4325,9 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
+                         pdu->header.status = SMB2_STATUS_MORE_PROCESSING_REQUIRED;
+                 }
+                 else {
++                        /* Final session-setup reply is about to go out: every
++                         * later PDU on a sealed connection must be a transform. */
++                        smb2->session_up = 1;
+                         if (server->handlers && server->handlers->session_established) {
+                                 ret = server->handlers->session_established(server, smb2);
+                                 if (ret) {
+diff --git a/Vendor/libsmb2/lib/socket.c b/Vendor/libsmb2/lib/socket.c
+index 5a4aa5f..1e6eb0e 100644
+--- a/Vendor/libsmb2/lib/socket.c
++++ b/Vendor/libsmb2/lib/socket.c
+@@ -483,6 +483,13 @@ read_more_data:
+                         smb2->recv_state = SMB2_RECV_TRFM;
+                         goto read_more_data;
+                 }
++                if (smb2_is_server(smb2) && smb2->seal && smb2->session_up &&
++                    smb2->enc_depth == 0) {
++                        /* enc_depth > 0 means this header is the inner
++                         * payload of a transform we already unsealed. */
++                        smb2_set_error(smb2, "unsealed PDU after encrypted session");
++                        return -1;
++                }
+                 if (smb2_decode_header(smb2, &smb2->in.iov[smb2->in.niov - 1],
+                                        &smb2->hdr) != 0) {
+                         smb2_set_error(smb2, "Failed to decode smb2 "

@@ -483,6 +483,13 @@ read_more_data:
                         smb2->recv_state = SMB2_RECV_TRFM;
                         goto read_more_data;
                 }
+                if (smb2_is_server(smb2) && smb2->seal && smb2->session_up &&
+                    smb2->enc_depth == 0) {
+                        /* enc_depth > 0 means this header is the inner
+                         * payload of a transform we already unsealed. */
+                        smb2_set_error(smb2, "unsealed PDU after encrypted session");
+                        return -1;
+                }
                 if (smb2_decode_header(smb2, &smb2->in.iov[smb2->in.niov - 1],
                                        &smb2->hdr) != 0) {
                         smb2_set_error(smb2, "Failed to decode smb2 "

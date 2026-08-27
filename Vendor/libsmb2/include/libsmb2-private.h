@@ -226,6 +226,10 @@ struct smb2_context {
         uint8_t seal:1;
         int8_t seal_requested;
         uint8_t sign:1;
+        /* Set when the final SESSION_SETUP success reply is queued. A
+         * sealing server then rejects any later PDU that is not wrapped
+         * in a transform header (plaintext downgrade). */
+        uint8_t session_up:1;
         uint8_t signing_key[SMB2_KEY_SIZE];
         uint8_t serverin_key[SMB2_KEY_SIZE];
         uint8_t serverout_key[SMB2_KEY_SIZE];

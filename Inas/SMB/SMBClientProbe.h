@@ -9,6 +9,8 @@
 extern "C" {
 #endif
 
+#if DEBUG
+
 /* Connect with the given dialect (0 = ANY3). Returns 0 on success. */
 int inas_smb_client_connect(const char *host, uint16_t port, const char *user, const char *password,
                             const char *share, uint16_t dialect, uint16_t *negotiated, char *err,
@@ -35,6 +37,14 @@ int inas_smb_client_open_many(const char *host, uint16_t port, const char *user,
 int inas_smb_client_write_bounds(const char *host, uint16_t port, const char *user,
                                  const char *password, const char *share, uint32_t ok_len,
                                  uint32_t big_len, char *err, int errlen);
+
+/* After a sealed session, send a plaintext CREATE. Returns 0 if the server
+ * drops the connection or rejects the PDU. */
+int inas_smb_client_plaintext_after_session(const char *host, uint16_t port, const char *user,
+                                            const char *password, const char *share, char *err,
+                                            int errlen);
+
+#endif /* DEBUG */
 
 #ifdef __cplusplus
 }

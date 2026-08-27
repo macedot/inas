@@ -212,6 +212,8 @@ final class ShareController {
     }
 
     func setShareFolder(_ url: URL, id: UUID) {
+        // Replacing the bookmark is intentional: a new folder pick must
+        // refresh the security-scoped bookmark, not reuse the previous one.
         guard let index = extras.firstIndex(where: { $0.id == id }),
               let (bookmark, title) = ShareStore.bookmark(for: url) else { return }
         extras[index].bookmark = bookmark

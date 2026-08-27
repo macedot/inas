@@ -9,11 +9,13 @@
 extern "C" {
 #endif
 
+#if DEBUG
 /* Legacy absolute-path resolver, retained only for unit tests of the
  * component validation rules (PathSandboxTests / PathSandbox.swift).
  * The server uses inas_path_resolve_at() exclusively.
  */
 int inas_path_resolve(const char *root, const char *smb_name, char *out, size_t out_len);
+#endif
 
 typedef struct inas_path {
         int dirfd;

@@ -78,3 +78,54 @@ inas_auth_slot *inas_auth_lookup(inas_auth_slot *table, int n, uint32_t ip, time
         empty->last_used = now;
         return empty;
 }
+
+int inas_auth_global_locked(const inas_auth_global *g, time_t now)
+{
+        if (!g) {
+                return 0;
+        }
+        return g->backoff_until > now;
+}
+
+void inas_auth_global_record_failure(inas_auth_global *g, time_t now)
+{
+        unsigned backoff;
+        unsigned shift;
+
+        if (!g) {
+                return;
+        }
+        if (g->backoff_until > now) {
+                return;
+        }
+        if (g->window_start == 0 || now - g->window_start >= INAS_AUTH_GLOBAL_WINDOW_SEC) {
+                g->window_start = now;
+                g->fails = 0;
+        }
+        g->fails++;
+        if (g->fails <= INAS_AUTH_GLOBAL_LIMIT) {
+                return;
+        }
+        g->streak++;
+        shift = g->streak - 1;
+        if (shift >= 31u ||
+            (INAS_AUTH_GLOBAL_BACKOFF_SEC << shift) > INAS_AUTH_GLOBAL_BACKOFF_CAP) {
+                backoff = INAS_AUTH_GLOBAL_BACKOFF_CAP;
+        } else {
+                backoff = INAS_AUTH_GLOBAL_BACKOFF_SEC << shift;
+        }
+        g->backoff_until = now + (time_t)backoff;
+        g->fails = 0;
+        g->window_start = 0;
+}
+
+void inas_auth_global_record_success(inas_auth_global *g)
+{
+        if (!g) {
+                return;
+        }
+        g->fails = 0;
+        g->window_start = 0;
+        g->backoff_until = 0;
+        g->streak = 0;
+}

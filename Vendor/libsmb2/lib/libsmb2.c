@@ -192,6 +192,7 @@ smb2_close_context(struct smb2_context *smb2)
                 smb2->session_key = NULL;
         }
         smb2->session_key_size = 0;
+        smb2->session_up = 0;
 }
 
 static int
@@ -4324,6 +4325,9 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                         pdu->header.status = SMB2_STATUS_MORE_PROCESSING_REQUIRED;
                 }
                 else {
+                        /* Final session-setup reply is about to go out: every
+                         * later PDU on a sealed connection must be a transform. */
+                        smb2->session_up = 1;
                         if (server->handlers && server->handlers->session_established) {
                                 ret = server->handlers->session_established(server, smb2);
                                 if (ret) {
