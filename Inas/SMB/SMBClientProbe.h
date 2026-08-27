@@ -44,6 +44,42 @@ int inas_smb_client_plaintext_after_session(const char *host, uint16_t port, con
                                             const char *password, const char *share, char *err,
                                             int errlen);
 
+/* Linux post-login commands: QFS sector/full size, stream info, network
+ * interface ioctl, and change-notify. Fails if any return
+ * STATUS_NOT_IMPLEMENTED. */
+int inas_smb_client_linux_post_login(const char *host, uint16_t port, const char *user,
+                                     const char *password, const char *share, char *err,
+                                     int errlen);
+
+/* IPC$ + srvsvc NetrShareEnum (Linux smbclient -L / gvfs browse). */
+int inas_smb_client_share_enum(const char *host, uint16_t port, const char *user,
+                               const char *password, const char *expect_share, char *err,
+                               int errlen);
+
+/* QUERY_DIRECTORY FileIdBothDirectoryInformation and check the on-wire
+ * layout the way macOS smbfs does (8-byte NextEntryOffset, no leftover
+ * bytes after the last unpadded entry). */
+int inas_smb_client_query_dir_wire(const char *host, uint16_t port, const char *user,
+                                   const char *password, const char *share, char *err, int errlen);
+
+/* macOS-style SET_INFO workflows: FileDispositionInformation delete on an
+ * open handle plus FileRenameInformation. Returns 0 if the delete unlinked
+ * and the rename moved the file. */
+int inas_smb_client_setinfo_delete_rename(const char *host, uint16_t port, const char *user,
+                                          const char *password, const char *share, char *err,
+                                          int errlen);
+
+/* Linux file-manager flow: smb2_stat() a subdirectory and a file inside it
+ * (compound CREATE + QUERY_INFO FileAllInformation + CLOSE). */
+int inas_smb_client_stat_entry(const char *host, uint16_t port, const char *user,
+                               const char *password, const char *share, char *err, int errlen);
+
+/* cifs.ko listing classes: QUERY_DIRECTORY FileFull / FileIdFull on a
+ * subdirectory handle, wire-validated. */
+int inas_smb_client_query_dir_classes(const char *host, uint16_t port, const char *user,
+                                      const char *password, const char *share, char *err,
+                                      int errlen);
+
 #endif /* DEBUG */
 
 #ifdef __cplusplus

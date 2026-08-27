@@ -30,6 +30,10 @@ struct ShareScreen: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                         .padding(.bottom, 24)
                 }
+                Text("v\(appVersion)")
+                    .font(.system(.caption, design: .rounded).weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .accessibilityLabel("Version \(appVersion)")
             }
             .padding(.horizontal, 24)
             .frame(maxWidth: 560)
@@ -53,6 +57,10 @@ struct ShareScreen: View {
             }
             .animation(.easeInOut(duration: 0.28), value: controller.state.isSharing)
         }
+    }
+
+    private var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.1"
     }
 
     private var sessionCard: some View {

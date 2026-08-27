@@ -401,11 +401,105 @@ smb2_process_set_info_request_variable(struct smb2_context *smb2,
         struct smb2_set_info_request *req = (struct smb2_set_info_request*)pdu->payload;
         struct smb2_iovec *iov = &smb2->in.iov[smb2->in.niov - 1];
 
-        if (!smb2->passthrough) {
-                smb2_set_error(smb2, "can not interpret set-info buffers yet");
+        if (req->buffer_length == 0) {
+                req->input_data = NULL;
+                return 0;
+        }
+        /* The variable tail holds exactly buffer_length bytes (the read loop
+         * grows it after the 32-byte fixed header), so a client that puts
+         * extra padding between the header and the buffer would already be
+         * misaligned here; all known clients (Windows, smbfs, libsmb2) place
+         * the buffer at offset SMB2_HEADER_SIZE + 32. */
+        if ((uint32_t)iov->len < req->buffer_length) {
+                smb2_set_error(smb2, "set-info buffer %u longer than PDU data %zu",
+                               req->buffer_length, iov->len);
                 return -1;
         }
-        req->input_data = iov->buf;
-        return 0;
+
+        switch (req->info_type) {
+        case SMB2_0_INFO_FILE:
+                switch (req->file_info_class) {
+                case SMB2_FILE_DISPOSITION_INFORMATION:
+                /* Raw little-endian buffers: the server handlers either read
+                 * a single byte or a uint64, or ignore the payload. */
+                case SMB2_FILE_END_OF_FILE_INFORMATION:
+                case SMB2_FILE_ALLOCATION_INFORMATION:
+                case SMB2_FILE_POSITION_INFORMATION:
+                case SMB2_FILE_MODE_INFORMATION:
+                case SMB2_FILE_BASIC_INFORMATION:
+                        req->input_data = iov->buf;
+                        return 0;
+                case SMB2_FILE_RENAME_INFORMATION:
+                case SMB2_FILE_LINK_INFORMATION: {
+                        /* MS-FSCC 2.4.34/2.4.22: 1-byte ReplaceIfExists,
+                         * 3 reserved, 8-byte RootDirectory, 4-byte
+                         * FileNameLength, then a UTF-16LE name (name at
+                         * offset 16). libsmb2's own client encoder uses a
+                         * 20-byte header (root at 8, length at 16, name at
+                         * 20); accept both — the standard layout always has
+                         * a non-zero length at 12, the libsmb2 layout has 0
+                         * there. The server handler expects a struct with a
+                         * NUL-terminated UTF-8 name pointer. */
+                        struct smb2_iovec v = { iov->buf, iov->len, NULL };
+                        struct smb2_file_rename_info *ri;
+                        const char *utf8_name;
+                        uint8_t replace;
+                        uint32_t len_std;
+                        uint32_t len_alt;
+                        uint32_t name_len;
+                        size_t name_off;
+                        size_t slen;
+                        void *ptr;
+
+                        if (iov->len < 20) {
+                                smb2_set_error(smb2, "rename/link buffer too short");
+                                return -1;
+                        }
+                        smb2_get_uint8(&v, 0, &replace);
+                        smb2_get_uint32(&v, 12, &len_std);
+                        smb2_get_uint32(&v, 16, &len_alt);
+                        if (len_std > 0 && (uint64_t)len_std <= (uint64_t)(iov->len - 16) &&
+                            !(len_std & 1)) {
+                                name_len = len_std;
+                                name_off = 16;
+                        } else if (len_alt > 0 &&
+                                   (uint64_t)len_alt <= (uint64_t)(iov->len - 20) &&
+                                   !(len_alt & 1)) {
+                                name_len = len_alt;
+                                name_off = 20;
+                        } else {
+                                smb2_set_error(smb2, "bad rename/link name length");
+                                return -1;
+                        }
+                        utf8_name = smb2_utf16_to_utf8((uint16_t *)(void *)(iov->buf + name_off),
+                                                       name_len / 2);
+                        if (utf8_name == NULL) {
+                                smb2_set_error(smb2, "can not decode rename/link name");
+                                return -1;
+                        }
+                        slen = strlen(utf8_name) + 1;
+                        ptr = smb2_alloc_init(smb2, sizeof(*ri) + slen);
+                        if (ptr == NULL) {
+                                free((void *)utf8_name);
+                                return -1;
+                        }
+                        ri = ptr;
+                        ri->replace_if_exist = replace;
+                        ri->file_name = (const uint8_t *)((uint8_t *)ptr + sizeof(*ri));
+                        memcpy((void *)ri->file_name, utf8_name, slen);
+                        free((void *)utf8_name);
+                        req->input_data = ri;
+                        return 0;
+                }
+                default:
+                        smb2_set_error(smb2, "can not interpret set-info file class %d yet",
+                                       req->file_info_class);
+                        return -1;
+                }
+        default:
+                smb2_set_error(smb2, "can not interpret set-info type %d yet",
+                               req->info_type);
+                return -1;
+        }
 }
 

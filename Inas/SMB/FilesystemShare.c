@@ -14,6 +14,7 @@
 #include "GlobMatch.h"
 #include "AuthThrottle.h"
 #include "DialectPolicy.h"
+#include "Srvsvc.h"
 
 #include <smb2/smb2.h>
 #include <smb2/libsmb2.h>
@@ -28,6 +29,7 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <time.h>
@@ -40,8 +42,13 @@
 #include <sys/statvfs.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <os/log.h>
+#endif
+
 #define INAS_MAX_HANDLES 256
 #define INAS_SHARE_DEFAULT "inas"
+#define INAS_TREE_IPC 0xFFFE
 #define PAD_TO_64BIT(len) (((len) + 0x07u) & 0xfffffff8u)
 
 struct inas_share {
@@ -53,6 +60,12 @@ struct inas_share {
 struct inas_handle {
         int in_use;
         smb2_file_id id;
+        /* Owning connection. Handles live and die with their TCP session:
+         * destruction_event frees every handle whose owner matches the
+         * disconnecting context, otherwise a browse-heavy client (Finder
+         * opens .DS_Store / AppleDouble / dir handles per folder) leaks
+         * slots until CREATE fails with ENOMEM forever. */
+        struct smb2_context *owner;
         int fd;
         int dirfd;
         DIR *dir;
@@ -62,6 +75,11 @@ struct inas_handle {
         uint32_t enum_index;
         int enum_done;
         uint32_t access;
+        int is_pipe;
+        uint32_t create_action;
+        uint8_t *rpc_out;
+        size_t rpc_out_len;
+        size_t rpc_out_off;
 };
 
 struct inas_state {
@@ -116,12 +134,13 @@ static struct inas_handle *handle_lookup(struct inas_state *fs, const smb2_file_
         return NULL;
 }
 
-static struct inas_handle *handle_alloc(struct inas_state *fs)
+static struct inas_handle *handle_alloc(struct inas_state *fs, struct smb2_context *owner)
 {
         for (int i = 0; i < INAS_MAX_HANDLES; i++) {
                 if (!fs->handles[i].in_use) {
                         memset(&fs->handles[i], 0, sizeof(fs->handles[i]));
                         fs->handles[i].in_use = 1;
+                        fs->handles[i].owner = owner;
                         fs->handles[i].fd = -1;
                         fs->handles[i].dirfd = -1;
                         fs->id_counter++;
@@ -153,9 +172,24 @@ static void handle_free(struct inas_handle *h)
         if (h->dirfd >= 0) {
                 close(h->dirfd);
         }
+        free(h->rpc_out);
         memset(h, 0, sizeof(*h));
         h->fd = -1;
         h->dirfd = -1;
+}
+
+/* Release every handle opened by `owner` (connection teardown or LOGOFF).
+ * Returns the number of handles freed. */
+static int handle_free_owned(struct inas_state *fs, struct smb2_context *owner)
+{
+        int freed = 0;
+        for (int i = 0; i < INAS_MAX_HANDLES; i++) {
+                if (fs->handles[i].in_use && fs->handles[i].owner == owner) {
+                        handle_free(&fs->handles[i]);
+                        freed++;
+                }
+        }
+        return freed;
 }
 
 static uint64_t timespec_to_smb(const struct timespec *ts)
@@ -229,9 +263,31 @@ static int access_to_open_flags(uint32_t desired)
         return O_RDONLY;
 }
 
+static uint32_t fs_bytes_per_sector(const struct statvfs *vfs)
+{
+        uint32_t b = vfs ? (uint32_t)vfs->f_frsize : 0;
+        return b >= 512 ? b : 512;
+}
+
+/* macOS treats inodes 0–15 as reserved Catalog Node IDs and fails the
+ * mount with "invalid" if the share root reports one of those. */
+static uint64_t inas_file_id(const struct stat *st)
+{
+        uint64_t ino = st ? (uint64_t)st->st_ino : 16;
+        return ino < 16 ? ino + 16 : ino;
+}
+
+/* TREE_CONNECT path is a UTF-16 UNC (`\\server\share`). Take the last
+ * non-empty component so host@port, DFS, and trailing slashes still
+ * resolve to the share name. */
 static int share_from_tree_path(const uint16_t *path, uint16_t path_length, char *out,
                                 size_t out_len)
 {
+        char copy[256];
+        const char *end;
+        const char *start;
+        size_t n;
+
         if (!path || path_length < 2 || !out || out_len == 0) {
                 return -1;
         }
@@ -239,17 +295,30 @@ static int share_from_tree_path(const uint16_t *path, uint16_t path_length, char
         if (!utf8) {
                 return -1;
         }
-        const char *slash = strrchr(utf8, '\\');
-        const char *name = slash ? slash + 1 : utf8;
-        if (name[0] == '\0') {
-                free((void *)utf8);
-                return -1;
-        }
-        if (snprintf(out, out_len, "%s", name) >= (int)out_len) {
+        if (snprintf(copy, sizeof(copy), "%s", utf8) >= (int)sizeof(copy)) {
                 free((void *)utf8);
                 return -1;
         }
         free((void *)utf8);
+
+        n = strlen(copy);
+        while (n > 0 && (copy[n - 1] == '\\' || copy[n - 1] == '/' || copy[n - 1] == '\0')) {
+                copy[--n] = '\0';
+        }
+        if (n == 0) {
+                return -1;
+        }
+        end = copy + n;
+        start = end;
+        while (start > copy && start[-1] != '\\' && start[-1] != '/') {
+                start--;
+        }
+        n = (size_t)(end - start);
+        if (n == 0 || n >= out_len) {
+                return -1;
+        }
+        memcpy(out, start, n);
+        out[n] = '\0';
         return 0;
 }
 
@@ -294,6 +363,13 @@ static int authorize_user(struct smb2_server *srvr, struct smb2_context *smb2, c
         const char *bare = user ? strrchr(user, '\\') : NULL;
         bare = (bare && bare[1]) ? bare + 1 : user;
         int ok = bare && strcasecmp(bare, fs->user) == 0 && fs->password[0] != '\0';
+#ifdef __APPLE__
+        os_log_debug(OS_LOG_DEFAULT, "inas-auth: provided=%{public}s expected=%{public}s ok=%d",
+                     bare ? bare : "(null)", fs->user, ok);
+#else
+        fprintf(stderr, "inas-auth: provided='%s' expected='%s' ok=%d\n", bare ? bare : "(null)",
+                fs->user, ok);
+#endif
         if (ok) {
                 smb2_set_user(smb2, fs->user);
                 smb2_set_password(smb2, fs->password);
@@ -332,18 +408,22 @@ static int auth_failed(struct smb2_server *srvr, struct smb2_context *smb2)
 static int destruction_event(struct smb2_server *srvr, struct smb2_context *smb2)
 {
         struct inas_state *fs = fs_state(srvr);
-        (void)smb2;
         int n = atomic_fetch_sub(&fs->clients, 1);
         if (n <= 1) {
                 atomic_store(&fs->clients, 0);
         }
+        pthread_mutex_lock(&fs->lock);
+        handle_free_owned(fs, smb2);
+        pthread_mutex_unlock(&fs->lock);
         return 0;
 }
 
 static int logoff_cmd(struct smb2_server *srvr, struct smb2_context *smb2)
 {
         struct inas_state *fs = fs_state(srvr);
-        (void)smb2;
+        pthread_mutex_lock(&fs->lock);
+        handle_free_owned(fs, smb2);
+        pthread_mutex_unlock(&fs->lock);
         return 0;
 }
 
@@ -355,10 +435,18 @@ static int tree_connect_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         (void)smb2;
         char share[128];
         if (share_from_tree_path(req->path, req->path_length, share, sizeof(share)) != 0) {
-                return -1;
+                return -EINVAL;
         }
         if (strcasecmp(share, "IPC$") == 0) {
-                return -1;
+                /* Samba/Linux browse the server via IPC$ after login.
+                 * Accept the pipe share so TREE_CONNECT is not reported as
+                 * STATUS_NOT_IMPLEMENTED ("function not implemented"). */
+                rep->share_type = SMB2_SHARE_TYPE_PIPE;
+                rep->share_flags = SMB2_SHAREFLAG_NO_CACHING | SMB2_SHAREFLAG_ENCRYPT_DATA;
+                rep->capabilities = 0;
+                rep->maximal_access = 0x0012019f;
+                rep->tree_id = INAS_TREE_IPC;
+                return 0;
         }
         pthread_mutex_lock(&fs->lock);
         int index = -1;
@@ -370,7 +458,7 @@ static int tree_connect_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         }
         pthread_mutex_unlock(&fs->lock);
         if (index < 0) {
-                return -1;
+                return -ENOENT;
         }
         rep->share_type = SMB2_SHARE_TYPE_DISK;
         rep->share_flags = SMB2_SHAREFLAG_NO_CACHING | SMB2_SHAREFLAG_ENCRYPT_DATA;
@@ -420,6 +508,7 @@ static int open_path(struct inas_handle *h, int rootfd, const char *smb_name,
                 }
                 h->delete_on_close = 0;
                 h->access = req->desired_access;
+                h->create_action = 1; /* FILE_OPENED */
                 return 0;
         }
 
@@ -431,7 +520,13 @@ static int open_path(struct inas_handle *h, int rootfd, const char *smb_name,
                 return -ENOTDIR;
         }
         if (exists && is_file_req && S_ISDIR(st->st_mode)) {
-                return -EISDIR;
+                /* Client sent FILE_NON_DIRECTORY_FILE without FILE_DIRECTORY_FILE
+                 * on a target that already exists as a directory (common for
+                 * libsmb2 / cifs.ko / gvfs which don't know the target type up
+                 * front). Samba is permissive here — open as directory rather
+                 * than rejecting with STATUS_FILE_IS_A_DIRECTORY. */
+                is_file_req = 0;
+                is_dir_req = 1;
         }
 
         if (!exists) {
@@ -449,10 +544,12 @@ static int open_path(struct inas_handle *h, int rootfd, const char *smb_name,
                         }
                         h->fd = fd;
                 }
+                h->create_action = 2; /* FILE_CREATED */
         } else {
                 if (disp == SMB2_FILE_CREATE) {
                         return -EEXIST;
                 }
+                h->create_action = 1; /* FILE_OPENED */
                 if (S_ISDIR(st->st_mode)) {
                         if (disp == SMB2_FILE_OVERWRITE || disp == SMB2_FILE_OVERWRITE_IF ||
                             disp == SMB2_FILE_SUPERSEDE) {
@@ -462,6 +559,7 @@ static int open_path(struct inas_handle *h, int rootfd, const char *smb_name,
                         if (disp == SMB2_FILE_OVERWRITE || disp == SMB2_FILE_OVERWRITE_IF ||
                             disp == SMB2_FILE_SUPERSEDE) {
                                 oflags |= O_TRUNC;
+                                h->create_action = 3; /* FILE_OVERWRITTEN */
                         }
                         if (disp == SMB2_FILE_SUPERSEDE) {
                                 unlinkat(h->dirfd, h->leaf, 0);
@@ -500,38 +598,119 @@ static int open_path(struct inas_handle *h, int rootfd, const char *smb_name,
         return 0;
 }
 
+static int pipe_name_is_srvsvc(const char *name)
+{
+        while (name && (*name == '\\' || *name == '/')) {
+                name++;
+        }
+        if (name && (!strncasecmp(name, "PIPE\\", 5) || !strncasecmp(name, "PIPE/", 5))) {
+                name += 5;
+        }
+        return name && strcasecmp(name, "srvsvc") == 0;
+}
+
+static int pipe_run_rpc(struct inas_state *fs, struct inas_handle *h, const uint8_t *in,
+                        size_t in_len)
+{
+        const char *names[INAS_MAX_SHARES + 1];
+        uint8_t *out = NULL;
+        size_t out_len = 0;
+        int n = 0;
+        int i;
+
+        for (i = 0; i < fs->share_count; i++) {
+                names[n++] = fs->shares[i].name;
+        }
+        names[n++] = "IPC$";
+        if (inas_srvsvc_process(in, in_len, names, n, &out, &out_len) != 0) {
+                free(h->rpc_out);
+                h->rpc_out = NULL;
+                h->rpc_out_len = 0;
+                h->rpc_out_off = 0;
+                return -EINVAL;
+        }
+        free(h->rpc_out);
+        h->rpc_out = out;
+        h->rpc_out_len = out_len;
+        h->rpc_out_off = 0;
+        return 0;
+}
+
 static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                       struct smb2_create_request *req, struct smb2_create_reply *rep)
 {
         struct inas_state *fs = fs_state(srvr);
         const char *name = req->name ? req->name : "";
+        uint32_t tid = smb2_tree_id(smb2);
+
+        if (tid == INAS_TREE_IPC) {
+                if (!pipe_name_is_srvsvc(name)) {
+                        return -ENOENT;
+                }
+                pthread_mutex_lock(&fs->lock);
+                struct inas_handle *h = handle_alloc(fs, smb2);
+                if (!h) {
+                        pthread_mutex_unlock(&fs->lock);
+                        return -ENOMEM;
+                }
+                h->is_pipe = 1;
+                memcpy(rep->file_id, h->id, SMB2_FD_SIZE);
+                rep->file_attributes = SMB2_FILE_ATTRIBUTE_NORMAL;
+                rep->create_action = 1; /* FILE_OPENED */
+                rep->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
+                pthread_mutex_unlock(&fs->lock);
+                return 0;
+        }
+
         int rootfd = share_rootfd_for_tree(fs, smb2);
         if (rootfd < 0) {
-                return -1;
+                return -EBADF;
+        }
+
+        /* Finder often CREATE's the share name as a child of the tree.
+         * If there is no real child with that name, treat it as the root. */
+        const char *open_name = name;
+        const char *leaf = name;
+        const char *share = share_name_for_tree(fs, smb2);
+        while (*leaf == '\\' || *leaf == '/') {
+                leaf++;
+        }
+        if (share && leaf[0] && strchr(leaf, '/') == NULL && strchr(leaf, '\\') == NULL &&
+            strcasecmp(leaf, share) == 0) {
+                struct stat child;
+                if (fstatat(rootfd, leaf, &child, AT_SYMLINK_NOFOLLOW) != 0) {
+                        open_name = "";
+                }
         }
 
         pthread_mutex_lock(&fs->lock);
-        struct inas_handle *h = handle_alloc(fs);
+        struct inas_handle *h = handle_alloc(fs, smb2);
         if (!h) {
                 pthread_mutex_unlock(&fs->lock);
-                return -1;
+                return -ENOMEM;
         }
         struct stat st;
         memset(&st, 0, sizeof(st));
-        int err = open_path(h, rootfd, name, req, &st);
+        int err = open_path(h, rootfd, open_name, req, &st);
         if (err != 0) {
                 handle_free(h);
                 pthread_mutex_unlock(&fs->lock);
-                return -1;
+                return err;
         }
         memcpy(rep->file_id, h->id, SMB2_FD_SIZE);
         rep->file_attributes = stat_to_attrs(&st);
-        rep->end_of_file = (uint64_t)st.st_size;
-        rep->allocation_size = (uint64_t)st.st_blocks * 512ull;
+        if (S_ISDIR(st.st_mode)) {
+                rep->end_of_file = 0;
+                rep->allocation_size = 0;
+        } else {
+                rep->end_of_file = (uint64_t)st.st_size;
+                rep->allocation_size = (uint64_t)st.st_blocks * 512ull;
+        }
         rep->creation_time = timespec_to_smb(&st.st_birthtimespec);
         rep->last_access_time = timespec_to_smb(&st.st_atimespec);
         rep->last_write_time = timespec_to_smb(&st.st_mtimespec);
         rep->change_time = timespec_to_smb(&st.st_ctimespec);
+        rep->create_action = h->create_action ? h->create_action : 1;
         rep->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
         pthread_mutex_unlock(&fs->lock);
         return 0;
@@ -546,7 +725,7 @@ static int close_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         struct inas_handle *h = handle_lookup(fs, req->file_id);
         if (!h) {
                 pthread_mutex_unlock(&fs->lock);
-                return -1;
+                return -EBADF;
         }
         struct stat st;
         memset(&st, 0, sizeof(st));
@@ -574,7 +753,7 @@ static int flush_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         struct inas_handle *h = handle_lookup(fs, req->file_id);
         if (!h) {
                 pthread_mutex_unlock(&fs->lock);
-                return -1;
+                return -EBADF;
         }
         if (h->fd >= 0) {
                 fsync(h->fd);
@@ -590,26 +769,54 @@ static int read_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         (void)smb2;
         pthread_mutex_lock(&fs->lock);
         struct inas_handle *h = handle_lookup(fs, req->file_id);
-        if (!h || h->fd < 0) {
+        if (!h) {
                 pthread_mutex_unlock(&fs->lock);
-                return -1;
+                return -EBADF;
+        }
+        if (h->is_pipe) {
+                size_t avail =
+                    h->rpc_out_len > h->rpc_out_off ? h->rpc_out_len - h->rpc_out_off : 0;
+                uint32_t n = req->length < avail ? req->length : (uint32_t)avail;
+                uint8_t *buf = malloc(n ? n : 1);
+                if (!buf) {
+                        pthread_mutex_unlock(&fs->lock);
+                        return -ENOMEM;
+                }
+                if (n) {
+                        memcpy(buf, h->rpc_out + h->rpc_out_off, n);
+                }
+                h->rpc_out_off += n;
+                pthread_mutex_unlock(&fs->lock);
+                if (n == 0) {
+                        free(buf);
+                        rep->data = NULL;
+                        rep->data_length = 0;
+                        return 0;
+                }
+                rep->data = buf;
+                rep->data_length = n;
+                return 0;
+        }
+        if (h->fd < 0) {
+                pthread_mutex_unlock(&fs->lock);
+                return -EBADF;
         }
         uint32_t len = req->length;
         uint32_t max_read = fs->server.max_read_size ? fs->server.max_read_size : 0x100000;
         if (len > max_read) {
                 pthread_mutex_unlock(&fs->lock);
-                return -1;
+                return -EINVAL;
         }
         uint8_t *buf = malloc(len ? len : 1);
         if (!buf) {
                 pthread_mutex_unlock(&fs->lock);
-                return -1;
+                return -ENOMEM;
         }
         ssize_t n = pread(h->fd, buf, len, (off_t)req->offset);
         pthread_mutex_unlock(&fs->lock);
         if (n < 0) {
                 free(buf);
-                return -1;
+                return -errno;
         }
         if (n == 0) {
                 free(buf);
@@ -632,19 +839,33 @@ static int write_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         (void)smb2;
         pthread_mutex_lock(&fs->lock);
         struct inas_handle *h = handle_lookup(fs, req->file_id);
-        if (!h || h->fd < 0) {
+        if (!h) {
                 pthread_mutex_unlock(&fs->lock);
-                return -1;
+                return -EBADF;
+        }
+        if (h->is_pipe) {
+                int rc = pipe_run_rpc(fs, h, req->buf, req->length);
+                pthread_mutex_unlock(&fs->lock);
+                if (rc != 0) {
+                        return rc;
+                }
+                rep->count = req->length;
+                rep->remaining = 0;
+                return 0;
+        }
+        if (h->fd < 0) {
+                pthread_mutex_unlock(&fs->lock);
+                return -EBADF;
         }
         uint32_t max_write = fs->server.max_write_size ? fs->server.max_write_size : 0x100000;
         if (req->length > max_write) {
                 pthread_mutex_unlock(&fs->lock);
-                return -1;
+                return -EINVAL;
         }
         ssize_t n = pwrite(h->fd, req->buf, req->length, (off_t)req->offset);
         pthread_mutex_unlock(&fs->lock);
         if (n < 0) {
-                return -1;
+                return -errno;
         }
         rep->count = (uint32_t)n;
         rep->remaining = 0;
@@ -657,6 +878,28 @@ static int match_pattern(const char *name, const char *pattern)
         return inas_glob_match(name, pattern);
 }
 
+static uint32_t qdir_entry_raw(uint8_t info_class, uint32_t fname16)
+{
+        switch (info_class) {
+        case SMB2_FILE_DIRECTORY_INFORMATION:
+                return 64 + fname16;
+        case SMB2_FILE_FULL_DIRECTORY_INFORMATION:
+                return 68 + fname16;
+        case SMB2_FILE_BOTH_DIRECTORY_INFORMATION:
+                return 94 + fname16;
+        case SMB2_FILE_NAMES_INFORMATION:
+                return 12 + fname16;
+        case SMB2_FILE_ID_FULL_DIRECTORY_INFORMATION:
+                return SMB2_FILEID_FULL_DIRECTORY_INFORMATION_SIZE + fname16;
+        case SMB2_FILE_ID_BOTH_DIRECTORY_INFORMATION:
+                return SMB2_FILEID_BOTH_DIRECTORY_INFORMATION_SIZE + fname16;
+        case SMB2_FILE_ID_EXTD_DIRECTORY_INFORMATION:
+                return SMB2_FILEID_EXTD_DIRECTORY_INFORMATION_SIZE + fname16;
+        default:
+                return SMB2_FILEID_BOTH_DIRECTORY_INFORMATION_SIZE + fname16;
+        }
+}
+
 static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                                struct smb2_query_directory_request *req,
                                struct smb2_query_directory_reply *rep)
@@ -665,9 +908,26 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
         (void)smb2;
         pthread_mutex_lock(&fs->lock);
         struct inas_handle *h = handle_lookup(fs, req->file_id);
-        if (!h || !h->is_dir) {
+        if (!h) {
                 pthread_mutex_unlock(&fs->lock);
-                return -1;
+                return -EBADF;
+        }
+        if (!h->is_dir) {
+                pthread_mutex_unlock(&fs->lock);
+                return -ENOTDIR;
+        }
+        switch (req->file_information_class) {
+        case SMB2_FILE_DIRECTORY_INFORMATION:
+        case SMB2_FILE_FULL_DIRECTORY_INFORMATION:
+        case SMB2_FILE_BOTH_DIRECTORY_INFORMATION:
+        case SMB2_FILE_NAMES_INFORMATION:
+        case SMB2_FILE_ID_BOTH_DIRECTORY_INFORMATION:
+        case SMB2_FILE_ID_FULL_DIRECTORY_INFORMATION:
+        case SMB2_FILE_ID_EXTD_DIRECTORY_INFORMATION:
+                break;
+        default:
+                pthread_mutex_unlock(&fs->lock);
+                return -ENOSYS;
         }
         if (req->flags & (SMB2_RESTART_SCANS | SMB2_REOPEN)) {
                 h->enum_index = 0;
@@ -701,10 +961,30 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
         struct smb2_fileidbothdirectoryinformation *entries = NULL;
         size_t count = 0;
         size_t cap = 0;
+        uint32_t room = req->output_buffer_length;
+        uint32_t padded_sum = 0;
 
-        while ((de = readdir(h->dir)) != NULL) {
+        for (;;) {
+                long loc = telldir(h->dir);
+                uint32_t fname16;
+                uint32_t raw;
+                uint32_t total_if_last;
+
+                de = readdir(h->dir);
+                if (de == NULL) {
+                        break;
+                }
                 if (!match_pattern(de->d_name, pattern)) {
                         continue;
+                }
+                fname16 = (uint32_t)strlen(de->d_name) * 2u;
+                raw = qdir_entry_raw(req->file_information_class, fname16);
+                total_if_last = padded_sum + raw;
+                if (room && count > 0 && total_if_last > room) {
+                        if (loc != -1) {
+                                seekdir(h->dir, loc);
+                        }
+                        break;
                 }
                 if (count + 1 > cap) {
                         cap = cap ? cap * 2 : 16;
@@ -727,10 +1007,16 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 stat_to_timeval(&st.st_atimespec, &e->last_access_time);
                 stat_to_timeval(&st.st_mtimespec, &e->last_write_time);
                 stat_to_timeval(&st.st_ctimespec, &e->change_time);
-                e->end_of_file = (uint64_t)st.st_size;
-                e->allocation_size = (uint64_t)st.st_blocks * 512ull;
-                e->file_attributes = stat_to_attrs(&st);
-                e->file_id = (uint64_t)st.st_ino;
+                if (de->d_type == DT_DIR || S_ISDIR(st.st_mode)) {
+                        e->file_attributes = SMB2_FILE_ATTRIBUTE_DIRECTORY;
+                        e->end_of_file = 0;
+                        e->allocation_size = 0;
+                } else {
+                        e->file_attributes = stat_to_attrs(&st);
+                        e->end_of_file = (uint64_t)st.st_size;
+                        e->allocation_size = (uint64_t)st.st_blocks * 512ull;
+                }
+                e->file_id = inas_file_id(&st);
                 e->name = strdup(de->d_name);
                 if (!e->name) {
                         for (size_t i = 0; i < count; i++) {
@@ -741,6 +1027,7 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                         return -1;
                 }
                 count++;
+                padded_sum += PAD_TO_64BIT(raw);
                 if (req->flags & SMB2_RETURN_SINGLE_ENTRY) {
                         break;
                 }
@@ -801,10 +1088,15 @@ static int fill_basic(const struct stat *st, struct smb2_file_basic_info *info)
 static int fill_standard(const struct stat *st, struct smb2_file_standard_info *info)
 {
         memset(info, 0, sizeof(*info));
-        info->allocation_size = (uint64_t)st->st_blocks * 512ull;
-        info->end_of_file = (uint64_t)st->st_size;
-        info->number_of_links = (uint32_t)st->st_nlink;
         info->directory = S_ISDIR(st->st_mode) ? 1 : 0;
+        if (info->directory) {
+                info->allocation_size = 0;
+                info->end_of_file = 0;
+        } else {
+                info->allocation_size = (uint64_t)st->st_blocks * 512ull;
+                info->end_of_file = (uint64_t)st->st_size;
+        }
+        info->number_of_links = (uint32_t)st->st_nlink;
         return (int)sizeof(*info);
 }
 
@@ -828,16 +1120,19 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 } else if (h->dirfd >= 0) {
                         fstat(h->dirfd, &st);
                 }
-                snprintf(namebuf, sizeof(namebuf), "%s",
-                         h->leaf[0] ? h->leaf : share_name_for_tree(fs, smb2));
+                if (h->leaf[0]) {
+                        snprintf(namebuf, sizeof(namebuf), "\\%s", h->leaf);
+                } else {
+                        snprintf(namebuf, sizeof(namebuf), "\\");
+                }
         } else if (rootfd >= 0) {
                 fstat(rootfd, &st);
-                snprintf(namebuf, sizeof(namebuf), "%s", share_name_for_tree(fs, smb2));
+                snprintf(namebuf, sizeof(namebuf), "\\");
         } else if (root) {
                 stat(root, &st);
-                snprintf(namebuf, sizeof(namebuf), "%s", share_name_for_tree(fs, smb2));
+                snprintf(namebuf, sizeof(namebuf), "\\");
         } else {
-                snprintf(namebuf, sizeof(namebuf), "%s", INAS_SHARE_DEFAULT);
+                snprintf(namebuf, sizeof(namebuf), "\\");
         }
         pthread_mutex_unlock(&fs->lock);
 
@@ -866,9 +1161,21 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         uint64_t *p = calloc(1, sizeof(uint64_t));
                         if (!p)
                                 return -1;
-                        *p = (uint64_t)st.st_ino;
+                        *p = inas_file_id(&st);
                         info = p;
                         len = 8;
+                        break;
+                }
+                case SMB2_FILE_ID_INFORMATION: {
+                        uint8_t *p = calloc(1, 24);
+                        uint64_t serial = 0x314e4153ull;
+                        uint64_t fid = inas_file_id(&st);
+                        if (!p)
+                                return -1;
+                        memcpy(p, &serial, 8);
+                        memcpy(p + 8, &fid, 8);
+                        info = p;
+                        len = 24;
                         break;
                 }
                 case SMB2_FILE_ACCESS_INFORMATION: {
@@ -887,7 +1194,7 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                                 return -1;
                         fill_basic(&st, &p->basic);
                         fill_standard(&st, &p->standard);
-                        p->index_number = (uint64_t)st.st_ino;
+                        p->index_number = inas_file_id(&st);
                         p->access_flags = 0x001f01ff;
                         char *stored = (char *)(p + 1);
                         memcpy(stored, namebuf, nlen);
@@ -904,9 +1211,14 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         stat_to_timeval(&st.st_atimespec, &p->last_access_time);
                         stat_to_timeval(&st.st_mtimespec, &p->last_write_time);
                         stat_to_timeval(&st.st_ctimespec, &p->change_time);
-                        p->allocation_size = (uint64_t)st.st_blocks * 512ull;
-                        p->end_of_file = (uint64_t)st.st_size;
                         p->file_attributes = stat_to_attrs(&st);
+                        if (S_ISDIR(st.st_mode)) {
+                                p->allocation_size = 0;
+                                p->end_of_file = 0;
+                        } else {
+                                p->allocation_size = (uint64_t)st.st_blocks * 512ull;
+                                p->end_of_file = (uint64_t)st.st_size;
+                        }
                         info = p;
                         len = (int)sizeof(*p);
                         break;
@@ -946,7 +1258,8 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         len = 4;
                         break;
                 }
-                case SMB2_FILE_NAME_INFORMATION: {
+                case SMB2_FILE_NAME_INFORMATION:
+                case SMB2_FILE_NORMALIZED_NAME_INFORMATION: {
                         size_t nlen = strlen(namebuf) + 1;
                         struct smb2_file_name_info *p = calloc(1, sizeof(*p) + nlen);
                         if (!p)
@@ -959,8 +1272,24 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         len = (int)sizeof(*p);
                         break;
                 }
+                case SMB2_FILE_STREAM_INFORMATION: {
+                        static const char stream[] = "::$DATA";
+                        size_t slen = sizeof(stream);
+                        struct smb2_file_stream_info *p = calloc(1, sizeof(*p) + slen);
+                        if (!p)
+                                return -1;
+                        char *stored = (char *)(p + 1);
+                        memcpy(stored, stream, slen);
+                        p->stream_name = stored;
+                        p->stream_name_length = (uint32_t)(sizeof(stream) - 1);
+                        p->stream_size = (uint64_t)st.st_size;
+                        p->stream_allocation_size = (uint64_t)st.st_blocks * 512ull;
+                        info = p;
+                        len = (int)sizeof(*p);
+                        break;
+                }
                 default:
-                        return -1;
+                        break;
                 }
         } else if (req->info_type == SMB2_0_INFO_FILESYSTEM) {
                 struct statvfs vfs;
@@ -993,7 +1322,7 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         p->total_allocation_units = vfs.f_blocks;
                         p->available_allocation_units = vfs.f_bavail;
                         p->sectors_per_allocation_unit = 1;
-                        p->bytes_per_sector = (uint32_t)vfs.f_frsize;
+                        p->bytes_per_sector = fs_bytes_per_sector(&vfs);
                         info = p;
                         len = (int)sizeof(*p);
                         break;
@@ -1012,7 +1341,8 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         struct smb2_file_fs_attribute_info *p = calloc(1, sizeof(*p));
                         if (!p)
                                 return -1;
-                        p->filesystem_attributes = 0x00000002; /* CASE_PRESERVED */
+                        /* CASE_PRESERVED_NAMES | UNICODE_ON_DISK */
+                        p->filesystem_attributes = 0x00000006;
                         p->maximum_component_name_length = 255;
                         p->filesystem_name = (const uint8_t *)"iNAS";
                         p->filesystem_name_length = 8;
@@ -1021,24 +1351,61 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         break;
                 }
                 case SMB2_FILE_FS_FULL_SIZE_INFORMATION: {
-                        struct smb2_file_fs_size_info *p = calloc(1, sizeof(*p));
+                        struct smb2_file_fs_full_size_info *p = calloc(1, sizeof(*p));
                         if (!p)
                                 return -1;
                         p->total_allocation_units = vfs.f_blocks;
-                        p->available_allocation_units = vfs.f_bavail;
+                        p->caller_available_allocation_units = vfs.f_bavail;
+                        p->actual_available_allocation_units = vfs.f_bfree;
                         p->sectors_per_allocation_unit = 1;
-                        p->bytes_per_sector = (uint32_t)vfs.f_frsize;
+                        p->bytes_per_sector = fs_bytes_per_sector(&vfs);
+                        info = p;
+                        len = (int)sizeof(*p);
+                        break;
+                }
+                case SMB2_FILE_FS_SECTOR_SIZE_INFORMATION: {
+                        struct smb2_file_fs_sector_size_info *p = calloc(1, sizeof(*p));
+                        uint32_t bps;
+                        if (!p)
+                                return -1;
+                        bps = fs_bytes_per_sector(&vfs);
+                        p->logical_bytes_per_sector = bps;
+                        p->physical_bytes_per_sector_for_atomicity = bps;
+                        p->physical_bytes_per_sector_for_performance = bps;
+                        p->file_system_effective_physical_bytes_per_sector_for_atomicity = bps;
+                        p->flags =
+                            SSINFO_FLAGS_ALIGNED_DEVICE | SSINFO_FLAGS_PARTITION_ALIGNED_ON_DEVICE;
+                        info = p;
+                        len = (int)sizeof(*p);
+                        break;
+                }
+                case SMB2_FILE_FS_OBJECT_ID_INFORMATION: {
+                        struct smb2_file_fs_object_id_info *p = calloc(1, sizeof(*p));
+                        if (!p)
+                                return -1;
+                        memcpy(p->object_id, "iNAS-volume-guid", SMB2_GUID_SIZE);
+                        info = p;
+                        len = (int)sizeof(*p);
+                        break;
+                }
+                case SMB2_FILE_FS_CONTROL_INFORMATION: {
+                        struct smb2_file_fs_control_info *p = calloc(1, sizeof(*p));
+                        if (!p)
+                                return -1;
                         info = p;
                         len = (int)sizeof(*p);
                         break;
                 }
                 default:
-                        return -1;
+                        break;
                 }
-        } else {
-                return -1;
         }
 
+        if (!info) {
+                /* Unknown class: STATUS_NOT_SUPPORTED (ENOSYS). An empty
+                 * SUCCESS reply makes Finder treat the root as missing. */
+                return -ENOSYS;
+        }
         rep->output_buffer = info;
         rep->output_buffer_length = (uint32_t)len;
         return len > 0 ? 0 : -1;
@@ -1119,11 +1486,11 @@ static int set_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 case SMB2_FILE_MODE_INFORMATION:
                         break;
                 default:
-                        rc = -1;
+                        rc = -ENOSYS;
                         break;
                 }
         } else {
-                rc = -1;
+                rc = -ENOSYS;
         }
         pthread_mutex_unlock(&fs->lock);
         return rc;
@@ -1137,8 +1504,50 @@ static int ioctl_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         memset(rep, 0, sizeof(*rep));
         rep->ctl_code = req->ctl_code;
         memcpy(rep->file_id, req->file_id, SMB2_FD_SIZE);
-        /* Do not ACK security FSCTLs we do not implement (e.g. validate-negotiate). */
-        return -1;
+        switch (req->ctl_code) {
+        case SMB2_FSCTL_PIPE_TRANSCEIVE: {
+                struct inas_handle *h;
+                int rc;
+                pthread_mutex_lock(&fs->lock);
+                h = handle_lookup(fs, req->file_id);
+                if (!h || !h->is_pipe) {
+                        pthread_mutex_unlock(&fs->lock);
+                        return -EBADF;
+                }
+                rc = pipe_run_rpc(fs, h, req->input, req->input_count);
+                if (rc != 0) {
+                        pthread_mutex_unlock(&fs->lock);
+                        return rc;
+                }
+                rep->output = h->rpc_out;
+                rep->output_count = (uint32_t)h->rpc_out_len;
+                pthread_mutex_unlock(&fs->lock);
+                return 0;
+        }
+        case SMB2_FSCTL_QUERY_NETWORK_INTERFACE_INFO:
+        case SMB2_FSCTL_LMR_REQUEST_RESILIENCY:
+        case SMB2_FSCTL_SRV_ENUMERATE_SNAPSHOTS:
+                return 0;
+        default:
+                return -ENOSYS;
+        }
+}
+
+static int change_notify_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
+                             struct smb2_change_notify_request *req,
+                             struct smb2_change_notify_reply *rep)
+{
+        struct inas_state *fs = fs_state(srvr);
+        (void)smb2;
+        (void)req;
+        (void)fs;
+        memset(rep, 0, sizeof(*rep));
+        /* We cannot hold notifications pending. Completing immediately —
+         * with SUCCESS or with NOTIFY_ENUM_DIR — makes clients (macOS smbfs
+         * watches every folder it displays) re-arm in a tight loop until
+         * they tear the share down. STATUS_NOT_SUPPORTED tells the client
+         * to fall back to polling, which is stable. */
+        return -ENOSYS;
 }
 
 static int lock_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
@@ -1182,7 +1591,7 @@ static struct smb2_server_request_handlers g_handlers = {destruction_event,
                                                          cancel_cmd,
                                                          echo_cmd,
                                                          query_directory_cmd,
-                                                         NULL,
+                                                         change_notify_cmd,
                                                          query_info_cmd,
                                                          set_info_cmd,
                                                          auth_failed};
@@ -1272,11 +1681,26 @@ static int inas_smb_start_config_ok(const inas_smb_config *config)
         return 1;
 }
 
+static void inas_ignore_sigpipe_once(void)
+{
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SIG_IGN;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGPIPE, &sa, NULL);
+}
+
 int inas_smb_start(const inas_smb_config *config)
 {
         if (!inas_smb_start_config_ok(config)) {
                 return -EINVAL;
         }
+        /* The server replies on a pthread; writing to a peer-closed socket
+         * delivers SIGPIPE to that thread and — by default — kills the whole
+         * process. Ignore SIGPIPE so a flaky client cannot bring down the
+         * server (and the iOS app with it). */
+        static pthread_once_t sigpipe_once = PTHREAD_ONCE_INIT;
+        pthread_once(&sigpipe_once, inas_ignore_sigpipe_once);
         pthread_mutex_lock(&g.lock);
         if (g.running) {
                 pthread_mutex_unlock(&g.lock);
@@ -1304,6 +1728,9 @@ int inas_smb_start(const inas_smb_config *config)
                         close_share_fds();
                         pthread_mutex_unlock(&g.lock);
                         return -EINVAL;
+                }
+                if (mkdir(rt, 0755) != 0 && errno != EEXIST) {
+                        /* realpath/open below report the real failure */
                 }
                 if (!realpath(rt, g.shares[g.share_count].root)) {
                         close_share_fds();

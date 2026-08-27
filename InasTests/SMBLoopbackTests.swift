@@ -193,6 +193,88 @@ final class SMBLoopbackTests: XCTestCase {
         XCTAssertEqual(inas_smb_is_running(), 0)
     }
 
+    func testTreeConnectTrailingSlash() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        var negotiated: UInt16 = 0
+        XCTAssertEqual(
+            inas_smb_client_connect("127.0.0.1", port, "inas", "correct1", "inas/", 0, &negotiated, &err, Int32(err.count)),
+            0,
+            "Linux TREE_CONNECT with a trailing slash must succeed: \(String(cString: err))"
+        )
+    }
+
+    func testIpcTreeConnectAfterLogin() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        var negotiated: UInt16 = 0
+        XCTAssertEqual(
+            inas_smb_client_connect("127.0.0.1", port, "inas", "correct1", "IPC$", 0, &negotiated, &err, Int32(err.count)),
+            0,
+            "Linux/Samba IPC$ TREE_CONNECT after login must not be NOT_IMPLEMENTED: \(String(cString: err))"
+        )
+    }
+
+    func testShareEnumOverIpcSrvsvc() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            inas_smb_client_share_enum("127.0.0.1", port, "inas", "correct1", "inas", &err, Int32(err.count)),
+            0,
+            String(cString: err)
+        )
+    }
+
+    func testQueryDirectoryWireMatchesMacOSParser() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            inas_smb_client_query_dir_wire("127.0.0.1", port, "inas", "correct1", "inas", &err, Int32(err.count)),
+            0,
+            String(cString: err)
+        )
+    }
+
+    func testSetInfoDeleteAndRename() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            inas_smb_client_setinfo_delete_rename("127.0.0.1", port, "inas", "correct1", "inas", &err, Int32(err.count)),
+            0,
+            "macOS-style SET_INFO delete/rename must work: \(String(cString: err))"
+        )
+    }
+
+    func testStatSubdirectoryLikeLinuxFileManager() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            inas_smb_client_stat_entry("127.0.0.1", port, "inas", "correct1", "inas", &err, Int32(err.count)),
+            0,
+            String(cString: err)
+        )
+    }
+
+    func testQueryDirectoryLinuxClassesOnSubdir() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            inas_smb_client_query_dir_classes("127.0.0.1", port, "inas", "correct1", "inas", &err, Int32(err.count)),
+            0,
+            String(cString: err)
+        )
+    }
+
+    func testLinuxPostLoginQueriesAreImplemented() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            inas_smb_client_linux_post_login("127.0.0.1", port, "inas", "correct1", "inas", &err, Int32(err.count)),
+            0,
+            String(cString: err)
+        )
+    }
+
     private func openFDCount() -> Int? {
         try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
     }

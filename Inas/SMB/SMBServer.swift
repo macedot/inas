@@ -49,6 +49,14 @@ final class SMBServer: SMBServing, @unchecked Sendable {
     var ports: [UInt16]
 
     init(ports: [UInt16] = [445, 4455]) {
+        #if DEBUG
+        // Simulator testing: INAS_SIM_PORT pins a single unprivileged port.
+        if let raw = ProcessInfo.processInfo.environment["INAS_SIM_PORT"],
+           let pinned = UInt16(raw), pinned > 0 {
+            self.ports = [pinned]
+            return
+        }
+        #endif
         self.ports = ports.isEmpty ? [445, 4455] : ports
     }
 

@@ -15,6 +15,13 @@ final class BackgroundShareKeeper: BackgroundShareKeeping {
 
     func sharingDidStart(onExpire: @escaping () -> Void) {
         self.onExpire = onExpire
+        #if DEBUG
+        // Simulator testing: background tasks expire almost immediately there,
+        // which would stop the share a second after it starts.
+        if ProcessInfo.processInfo.environment["INAS_SIM_AUTOSTART"] == "1" {
+            return
+        }
+        #endif
         UIApplication.shared.isIdleTimerDisabled = true
         requestNotificationPermission()
         beginGraceTask()
@@ -60,6 +67,12 @@ final class BackgroundShareKeeper: BackgroundShareKeeping {
     }
 
     private func requestNotificationPermission() {
+        #if DEBUG
+        // Simulator testing: skip the prompt so headless automation is not blocked.
+        if ProcessInfo.processInfo.environment["INAS_SIM_AUTOSTART"] == "1" {
+            return
+        }
+        #endif
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 

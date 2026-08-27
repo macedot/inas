@@ -6,6 +6,7 @@
  * of the app carry no SMB client code. */
 
 #include "SMBClientProbe.h"
+#include "Srvsvc.h"
 
 #include <sys/types.h>
 #include <time.h>
@@ -30,7 +31,9 @@ static void set_err(char *err, int errlen, struct smb2_context *smb2, const char
         if (!err || errlen <= 0) {
                 return;
         }
-        if (msg && msg[0]) {
+        if (msg && msg[0] && fallback && fallback[0]) {
+                snprintf(err, (size_t)errlen, "%s: %s", fallback, msg);
+        } else if (msg && msg[0]) {
                 snprintf(err, (size_t)errlen, "%s", msg);
         } else if (fallback) {
                 snprintf(err, (size_t)errlen, "%s", fallback);
@@ -448,6 +451,773 @@ int inas_smb_client_plaintext_after_session(const char *host, uint16_t port, con
         set_err(err, errlen, NULL, "server kept the connection after plaintext CREATE");
         smb2_destroy_context(smb2);
         return -1;
+}
+
+static int run_until_status(struct smb2_context *smb2, struct smb2_pdu *pdu, struct raw_status *rs,
+                            const char *what, char *err, int errlen)
+{
+        if (!pdu) {
+                set_err(err, errlen, smb2, what);
+                return -1;
+        }
+        memset(rs, 0, sizeof(*rs));
+        smb2_queue_pdu(smb2, pdu);
+        if (wait_for_cb(smb2, rs) != 0) {
+                snprintf(err, (size_t)errlen, "%s timed out", what);
+                return -1;
+        }
+        if (rs->status == (int)SMB2_STATUS_NOT_IMPLEMENTED) {
+                snprintf(err, (size_t)errlen, "%s: STATUS_NOT_IMPLEMENTED", what);
+                return -1;
+        }
+        return 0;
+}
+
+int inas_smb_client_linux_post_login(const char *host, uint16_t port, const char *user,
+                                     const char *password, const char *share, char *err, int errlen)
+{
+        struct smb2_context *smb2;
+        struct smb2_query_info_request qi;
+        struct smb2_ioctl_request io;
+        struct smb2_change_notify_request cn;
+        struct smb2fh *fh;
+        struct raw_status rs;
+        int rc = -1;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+
+        memset(&qi, 0, sizeof(qi));
+        qi.info_type = SMB2_0_INFO_FILESYSTEM;
+        qi.file_info_class = SMB2_FILE_FS_SECTOR_SIZE_INFORMATION;
+        qi.output_buffer_length = 4096;
+        memcpy(qi.file_id, compound_file_id, SMB2_FD_SIZE);
+        if (run_until_status(smb2, smb2_cmd_query_info_async(smb2, &qi, raw_cb, &rs), &rs,
+                             "FileFsSectorSizeInformation", err, errlen) != 0) {
+                goto out;
+        }
+
+        qi.file_info_class = SMB2_FILE_FS_FULL_SIZE_INFORMATION;
+        if (run_until_status(smb2, smb2_cmd_query_info_async(smb2, &qi, raw_cb, &rs), &rs,
+                             "FileFsFullSizeInformation", err, errlen) != 0) {
+                goto out;
+        }
+
+        memset(&io, 0, sizeof(io));
+        io.ctl_code = SMB2_FSCTL_QUERY_NETWORK_INTERFACE_INFO;
+        memcpy(io.file_id, compound_file_id, SMB2_FD_SIZE);
+        io.flags = SMB2_0_IOCTL_IS_FSCTL;
+        if (run_until_status(smb2, smb2_cmd_ioctl_async(smb2, &io, raw_cb, &rs), &rs,
+                             "QUERY_NETWORK_INTERFACE_INFO", err, errlen) != 0) {
+                goto out;
+        }
+
+        fh = smb2_open(smb2, "", O_RDONLY);
+        if (!fh) {
+                fh = smb2_open(smb2, ".", O_RDONLY);
+        }
+        if (!fh) {
+                set_err(err, errlen, smb2, "open share root failed");
+                goto out;
+        }
+
+        memset(&qi, 0, sizeof(qi));
+        qi.info_type = SMB2_0_INFO_FILE;
+        qi.file_info_class = SMB2_FILE_STREAM_INFORMATION;
+        qi.output_buffer_length = 4096;
+        memcpy(qi.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        if (run_until_status(smb2, smb2_cmd_query_info_async(smb2, &qi, raw_cb, &rs), &rs,
+                             "FileStreamInformation", err, errlen) != 0) {
+                smb2_close(smb2, fh);
+                goto out;
+        }
+
+        memset(&cn, 0, sizeof(cn));
+        cn.output_buffer_length = 4096;
+        memcpy(cn.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        cn.completion_filter = SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_FILE_NAME |
+                               SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_DIR_NAME;
+        if (run_until_status(smb2, smb2_cmd_change_notify_async(smb2, &cn, raw_cb, &rs), &rs,
+                             "CHANGE_NOTIFY", err, errlen) != 0) {
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        smb2_close(smb2, fh);
+
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        smb2_disconnect_share(smb2);
+        smb2_destroy_context(smb2);
+        return rc;
+}
+
+struct ioctl_status {
+        volatile int done;
+        int status;
+        uint8_t *out;
+        size_t out_len;
+};
+
+static void ioctl_cb(struct smb2_context *smb2, int status, void *command_data, void *cb_data)
+{
+        struct ioctl_status *is = cb_data;
+        struct smb2_ioctl_reply *rep = command_data;
+
+        (void)smb2;
+        if (status == 0 && rep && rep->output && rep->output_count) {
+                is->out = malloc(rep->output_count);
+                if (is->out) {
+                        memcpy(is->out, rep->output, rep->output_count);
+                        is->out_len = rep->output_count;
+                }
+        }
+        is->status = status;
+        is->done = 1;
+}
+
+static int wait_ioctl(struct smb2_context *smb2, struct smb2_pdu *pdu, struct ioctl_status *is,
+                      const char *what, char *err, int errlen)
+{
+        if (!pdu) {
+                set_err(err, errlen, smb2, what);
+                return -1;
+        }
+        smb2_queue_pdu(smb2, pdu);
+        while (!is->done) {
+                struct pollfd pfd;
+
+                pfd.fd = smb2_get_fd(smb2);
+                pfd.events = (short)smb2_which_events(smb2);
+                pfd.revents = 0;
+                if (poll(&pfd, 1, 5000) < 1) {
+                        snprintf(err, (size_t)errlen, "%s timed out", what);
+                        return -1;
+                }
+                if (smb2_service(smb2, pfd.revents) < 0) {
+                        set_err(err, errlen, smb2, what);
+                        return -1;
+                }
+        }
+        if (is->status != 0) {
+                set_err(err, errlen, smb2, what);
+                return -1;
+        }
+        return 0;
+}
+
+static int stub_enum_ok(const char *share, uint32_t level, char *err, int errlen)
+{
+        uint8_t enumreq[256];
+        uint8_t *out = NULL;
+        size_t out_len = 0;
+        size_t elen;
+        const char *names[1];
+
+        names[0] = share;
+        elen = inas_srvsvc_build_enum(enumreq, sizeof(enumreq), 2, level);
+        if (!elen) {
+                set_err(err, errlen, NULL, "build enum failed");
+                return -1;
+        }
+        if (inas_srvsvc_process(enumreq, elen, names, 1, &out, &out_len) != 0 ||
+            !inas_srvsvc_enum_has_share(out, out_len, names[0])) {
+                set_err(err, errlen, NULL, "srvsvc NetrShareEnum NDR missed share");
+                free(out);
+                return -1;
+        }
+        free(out);
+        return 0;
+}
+
+int inas_smb_client_share_enum(const char *host, uint16_t port, const char *user,
+                               const char *password, const char *expect_share, char *err,
+                               int errlen)
+{
+        struct smb2_context *smb2 = NULL;
+        struct smb2fh *fh;
+        struct smb2_ioctl_request io;
+        struct smb2_pdu *pdu;
+        struct ioctl_status is;
+        uint8_t bind[128];
+        uint8_t enumreq[256];
+        uint8_t *out = NULL;
+        size_t out_len = 0;
+        size_t blen;
+        size_t elen;
+        const char *names[1];
+        const char *share = expect_share ? expect_share : "inas";
+        int rc = -1;
+
+        names[0] = share;
+        blen = inas_srvsvc_build_bind(bind, sizeof(bind), 1);
+        if (!blen) {
+                set_err(err, errlen, NULL, "build bind failed");
+                return -1;
+        }
+        if (inas_srvsvc_process(bind, blen, names, 1, &out, &out_len) != 0 || !out ||
+            out[2] != 12) {
+                set_err(err, errlen, NULL, "srvsvc bind_ack failed");
+                free(out);
+                return -1;
+        }
+        free(out);
+        if (stub_enum_ok(share, 0, err, errlen) != 0 || stub_enum_ok(share, 1, err, errlen) != 0 ||
+            stub_enum_ok(share, 2, err, errlen) != 0) {
+                return -1;
+        }
+
+        smb2 = open_share(host, port, user, password, "IPC$", 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+        fh = smb2_open(smb2, "srvsvc", O_RDWR);
+        if (!fh) {
+                set_err(err, errlen, smb2, "CREATE srvsvc failed");
+                goto out;
+        }
+
+        memset(&io, 0, sizeof(io));
+        io.ctl_code = SMB2_FSCTL_PIPE_TRANSCEIVE;
+        memcpy(io.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        io.flags = SMB2_0_IOCTL_IS_FSCTL;
+        io.input = bind;
+        io.input_count = (uint32_t)blen;
+        memset(&is, 0, sizeof(is));
+        pdu = smb2_cmd_ioctl_async(smb2, &io, ioctl_cb, &is);
+        if (wait_ioctl(smb2, pdu, &is, "srvsvc bind", err, errlen) != 0) {
+                free(is.out);
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        free(is.out);
+
+        elen = inas_srvsvc_build_enum(enumreq, sizeof(enumreq), 2, 1);
+        io.input = enumreq;
+        io.input_count = (uint32_t)elen;
+        memset(&is, 0, sizeof(is));
+        pdu = smb2_cmd_ioctl_async(smb2, &io, ioctl_cb, &is);
+        if (wait_ioctl(smb2, pdu, &is, "NetrShareEnum", err, errlen) != 0) {
+                free(is.out);
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        if (!inas_srvsvc_enum_has_share(is.out, is.out_len, share)) {
+                set_err(err, errlen, NULL, "NetrShareEnum reply missing share or bad NDR");
+                free(is.out);
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        free(is.out);
+        smb2_close(smb2, fh);
+        smb2_disconnect_share(smb2);
+        smb2_destroy_context(smb2);
+        smb2 = NULL;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+        {
+                struct smb2dir *dir = smb2_opendir(smb2, "");
+                if (!dir) {
+                        set_err(err, errlen, smb2, "opendir share root failed");
+                        goto out;
+                }
+                smb2_closedir(smb2, dir);
+                dir = smb2_opendir(smb2, share);
+                if (!dir) {
+                        set_err(err, errlen, smb2, "opendir share-name alias failed");
+                        goto out;
+                }
+                smb2_closedir(smb2, dir);
+        }
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        if (smb2) {
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        return rc;
+}
+
+struct qdir_wire {
+        volatile int done;
+        int status;
+        uint8_t *buf;
+        uint32_t len;
+};
+
+static void qdir_wire_cb(struct smb2_context *smb2, int status, void *command_data, void *cb_data)
+{
+        struct qdir_wire *w = cb_data;
+        struct smb2_query_directory_reply *rep = command_data;
+
+        (void)smb2;
+        w->status = status;
+        if (status == 0 && rep && rep->output_buffer && rep->output_buffer_length) {
+                w->len = rep->output_buffer_length;
+                w->buf = malloc(w->len);
+                if (w->buf) {
+                        memcpy(w->buf, rep->output_buffer, w->len);
+                }
+        }
+        w->done = 1;
+}
+
+static uint32_t rd_le32(const uint8_t *p)
+{
+        return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+               ((uint32_t)p[3] << 24);
+}
+
+/* macOS smbfs walks directory records and returns EBADRPC ("RPC struct is
+ * bad") if NextEntryOffset is not 8-aligned or if leftover bytes remain
+ * after an unpadded last entry. `hdr` is the fixed part of the record;
+ * FileNameLength sits at offset 60 in every class checked here. */
+static int apple_parse_dir_records(const uint8_t *buf, uint32_t len, uint32_t hdr, char *err,
+                                   int errlen)
+{
+        uint32_t off = 0;
+        unsigned n = 0;
+
+        if (len == 0) {
+                snprintf(err, (size_t)errlen, "empty QUERY_DIRECTORY payload");
+                return -1;
+        }
+        while (off < len) {
+                uint32_t next;
+                uint32_t namelen;
+                uint32_t used;
+
+                if (len - off < hdr) {
+                        snprintf(err, (size_t)errlen,
+                                 "short directory entry at %u remain %u (Apple EBADRPC)", off,
+                                 len - off);
+                        return -1;
+                }
+                next = rd_le32(buf + off);
+                namelen = rd_le32(buf + off + 60);
+                if (next != 0 && (next & 7u) != 0) {
+                        snprintf(err, (size_t)errlen, "NextEntryOffset %u is not 8-byte aligned",
+                                 next);
+                        return -1;
+                }
+                if (namelen & 1u) {
+                        snprintf(err, (size_t)errlen, "odd FileNameLength %u", namelen);
+                        return -1;
+                }
+                if (namelen > len - off - hdr) {
+                        snprintf(err, (size_t)errlen, "FileNameLength %u overflows buffer",
+                                 namelen);
+                        return -1;
+                }
+                used = hdr + namelen;
+                if (next == 0) {
+                        if (off + used != len) {
+                                snprintf(err, (size_t)errlen,
+                                         "last entry leftover %u bytes (Apple EBADRPC)",
+                                         len - (off + used));
+                                return -1;
+                        }
+                        n++;
+                        break;
+                }
+                if (next < used) {
+                        snprintf(err, (size_t)errlen, "NextEntryOffset %u < entry %u", next, used);
+                        return -1;
+                }
+                if (next > len - off) {
+                        snprintf(err, (size_t)errlen, "NextEntryOffset %u past buffer", next);
+                        return -1;
+                }
+                off += next;
+                n++;
+        }
+        if (n == 0) {
+                snprintf(err, (size_t)errlen, "no directory entries");
+                return -1;
+        }
+        return 0;
+}
+
+static int apple_parse_id_both(const uint8_t *buf, uint32_t len, char *err, int errlen)
+{
+        return apple_parse_dir_records(buf, len, SMB2_FILEID_BOTH_DIRECTORY_INFORMATION_SIZE, err,
+                                       errlen);
+}
+
+int inas_smb_client_query_dir_wire(const char *host, uint16_t port, const char *user,
+                                   const char *password, const char *share, char *err, int errlen)
+{
+        struct smb2_context *smb2;
+        struct smb2fh *fh;
+        struct smb2_query_directory_request req;
+        struct qdir_wire w;
+        struct smb2_pdu *pdu;
+        int rc = -1;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+        fh = smb2_open(smb2, "", O_RDONLY);
+        if (!fh) {
+                fh = smb2_open(smb2, ".", O_RDONLY);
+        }
+        if (!fh) {
+                set_err(err, errlen, smb2, "open share root failed");
+                goto out;
+        }
+
+        memset(&req, 0, sizeof(req));
+        req.file_information_class = SMB2_FILE_ID_BOTH_DIRECTORY_INFORMATION;
+        req.flags = SMB2_RESTART_SCANS;
+        memcpy(req.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        req.name = "*";
+        req.output_buffer_length = 0x10000;
+
+        memset(&w, 0, sizeof(w));
+        pdu = smb2_cmd_query_directory_async(smb2, &req, qdir_wire_cb, &w);
+        if (!pdu) {
+                set_err(err, errlen, smb2, "QUERY_DIRECTORY alloc failed");
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        smb2_queue_pdu(smb2, pdu);
+        if (wait_for_cb(smb2, (struct raw_status *)&w) != 0) {
+                snprintf(err, (size_t)errlen, "QUERY_DIRECTORY timed out");
+                free(w.buf);
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        if (w.status != 0) {
+                snprintf(err, (size_t)errlen, "QUERY_DIRECTORY status 0x%x", (unsigned)w.status);
+                free(w.buf);
+                goto out;
+        }
+        if (!w.buf) {
+                snprintf(err, (size_t)errlen, "QUERY_DIRECTORY missing output buffer");
+                goto out;
+        }
+        rc = apple_parse_id_both(w.buf, w.len, err, errlen);
+        free(w.buf);
+        if (rc == 0) {
+                set_err(err, errlen, NULL, NULL);
+        }
+out:
+        if (smb2) {
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        return rc;
+}
+
+/* macOS Finder deletes and renames via SET_INFO (FileDispositionInformation
+ * / FileRenameInformation) on an open handle, not via a delete-on-close
+ * CREATE. Both must succeed and take effect on close. */
+int inas_smb_client_setinfo_delete_rename(const char *host, uint16_t port, const char *user,
+                                          const char *password, const char *share, char *err,
+                                          int errlen)
+{
+        struct smb2_context *smb2;
+        struct smb2fh *fh;
+        struct smb2_set_info_request sr;
+        struct smb2_file_disposition_info fdi;
+        struct smb2_file_rename_info rni;
+        struct raw_status rs;
+        int rc = -1;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+
+        fh = smb2_open(smb2, "si-del.txt", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create si-del.txt failed");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+
+        fh = smb2_open(smb2, "si-del.txt", O_RDWR);
+        if (!fh) {
+                set_err(err, errlen, smb2, "reopen si-del.txt failed");
+                goto out;
+        }
+        memset(&sr, 0, sizeof(sr));
+        sr.info_type = SMB2_0_INFO_FILE;
+        sr.file_info_class = SMB2_FILE_DISPOSITION_INFORMATION;
+        memcpy(sr.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        fdi.delete_pending = 1;
+        sr.input_data = &fdi;
+        if (run_until_status(smb2, smb2_cmd_set_info_async(smb2, &sr, raw_cb, &rs), &rs,
+                             "FileDispositionInformation", err, errlen) != 0) {
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        if (rs.status != 0) {
+                snprintf(err, (size_t)errlen, "FileDispositionInformation status 0x%x",
+                         (unsigned)rs.status);
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        fh = smb2_open(smb2, "si-del.txt", O_RDONLY);
+        if (fh) {
+                smb2_close(smb2, fh);
+                set_err(err, errlen, NULL, "delete_pending close did not unlink si-del.txt");
+                goto out;
+        }
+
+        fh = smb2_open(smb2, "si-rn-a.txt", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create si-rn-a.txt failed");
+                goto out;
+        }
+        memset(&sr, 0, sizeof(sr));
+        sr.info_type = SMB2_0_INFO_FILE;
+        sr.file_info_class = SMB2_FILE_RENAME_INFORMATION;
+        memcpy(sr.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        rni.replace_if_exist = 0;
+        rni.file_name = (const uint8_t *)"si-rn-b.txt";
+        sr.input_data = &rni;
+        if (run_until_status(smb2, smb2_cmd_set_info_async(smb2, &sr, raw_cb, &rs), &rs,
+                             "FileRenameInformation", err, errlen) != 0) {
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        if (rs.status != 0) {
+                snprintf(err, (size_t)errlen, "FileRenameInformation status 0x%x",
+                         (unsigned)rs.status);
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        fh = smb2_open(smb2, "si-rn-a.txt", O_RDONLY);
+        if (fh) {
+                smb2_close(smb2, fh);
+                set_err(err, errlen, NULL, "old name si-rn-a.txt still resolves after rename");
+                goto out;
+        }
+        fh = smb2_open(smb2, "si-rn-b.txt", O_RDONLY);
+        if (!fh) {
+                set_err(err, errlen, smb2, "rename target si-rn-b.txt missing");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+
+        /* Finder move-into-folder is the same SET_INFO rename with a
+         * directory-qualified target name. */
+        if (smb2_mkdir(smb2, "si-dir") != 0) {
+                set_err(err, errlen, smb2, "mkdir si-dir failed");
+                goto out;
+        }
+        fh = smb2_open(smb2, "si-rn-b.txt", O_RDWR);
+        if (!fh) {
+                set_err(err, errlen, smb2, "reopen si-rn-b.txt for move failed");
+                goto out;
+        }
+        memset(&sr, 0, sizeof(sr));
+        sr.info_type = SMB2_0_INFO_FILE;
+        sr.file_info_class = SMB2_FILE_RENAME_INFORMATION;
+        memcpy(sr.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        rni.replace_if_exist = 0;
+        rni.file_name = (const uint8_t *)"si-dir/si-rn-b.txt";
+        sr.input_data = &rni;
+        if (run_until_status(smb2, smb2_cmd_set_info_async(smb2, &sr, raw_cb, &rs), &rs,
+                             "FileRenameInformation move", err, errlen) != 0) {
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        fh = smb2_open(smb2, "si-dir/si-rn-b.txt", O_RDONLY);
+        if (!fh) {
+                set_err(err, errlen, smb2, "moved file si-dir/si-rn-b.txt missing");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        fh = smb2_open(smb2, "si-rn-b.txt", O_RDONLY);
+        if (fh) {
+                smb2_close(smb2, fh);
+                set_err(err, errlen, NULL, "old root name si-rn-b.txt still present after move");
+                goto out;
+        }
+
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        if (smb2) {
+                smb2_unlink(smb2, "si-del.txt");
+                smb2_unlink(smb2, "si-rn-a.txt");
+                smb2_unlink(smb2, "si-rn-b.txt");
+                smb2_unlink(smb2, "si-dir/si-rn-b.txt");
+                smb2_rmdir(smb2, "si-dir");
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        return rc;
+}
+
+/* Linux file managers (gvfs, kio_smb) stat the directory and every entry
+ * when a folder is opened. smb2_stat() compounds CREATE + QUERY_INFO
+ * (FileAllInformation) + CLOSE, exercising the related-fid fixup. */
+int inas_smb_client_stat_entry(const char *host, uint16_t port, const char *user,
+                               const char *password, const char *share, char *err, int errlen)
+{
+        struct smb2_context *smb2;
+        struct smb2fh *fh;
+        struct smb2_stat_64 st;
+        int rc = -1;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+        if (smb2_mkdir(smb2, "stat-dir") != 0) {
+                set_err(err, errlen, smb2, "mkdir stat-dir failed");
+                goto out;
+        }
+        fh = smb2_open(smb2, "stat-dir/file.txt", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create stat-dir/file.txt failed");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+
+        memset(&st, 0, sizeof(st));
+        if (smb2_stat(smb2, "stat-dir", &st) != 0) {
+                set_err(err, errlen, smb2, "stat subdir failed");
+                goto out;
+        }
+        if (st.smb2_type != SMB2_TYPE_DIRECTORY) {
+                set_err(err, errlen, NULL, "stat subdir reports non-directory type");
+                goto out;
+        }
+        memset(&st, 0, sizeof(st));
+        if (smb2_stat(smb2, "stat-dir/file.txt", &st) != 0) {
+                set_err(err, errlen, smb2, "stat file in subdir failed");
+                goto out;
+        }
+        if (st.smb2_type != SMB2_TYPE_FILE) {
+                set_err(err, errlen, NULL, "stat file in subdir reports non-file type");
+                goto out;
+        }
+
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        if (smb2) {
+                smb2_unlink(smb2, "stat-dir/file.txt");
+                smb2_rmdir(smb2, "stat-dir");
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        return rc;
+}
+
+/* cifs.ko lists directories with FileFullDirectoryInformation /
+ * FileIdFullDirectoryInformation, not the FileIdBoth class macOS uses.
+ * Run both against a subdirectory handle and validate the wire layout. */
+int inas_smb_client_query_dir_classes(const char *host, uint16_t port, const char *user,
+                                      const char *password, const char *share, char *err,
+                                      int errlen)
+{
+        static const struct {
+                uint8_t cls;
+                uint32_t hdr;
+                const char *label;
+        } classes[] = {
+            {SMB2_FILE_FULL_DIRECTORY_INFORMATION, 68, "FileFullDirectoryInformation"},
+            {SMB2_FILE_ID_FULL_DIRECTORY_INFORMATION, SMB2_FILEID_FULL_DIRECTORY_INFORMATION_SIZE,
+             "FileIdFullDirectoryInformation"},
+        };
+        struct smb2_context *smb2 = NULL;
+        struct smb2fh *fh = NULL;
+        int rc = -1;
+        size_t i;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+        if (smb2_mkdir(smb2, "qdir-dir") != 0) {
+                set_err(err, errlen, smb2, "mkdir qdir-dir failed");
+                goto out;
+        }
+        fh = smb2_open(smb2, "qdir-dir/entry.txt", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create qdir-dir/entry.txt failed");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        fh = NULL;
+
+        for (i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) {
+                struct smb2_query_directory_request req;
+                struct qdir_wire w;
+                struct smb2_pdu *pdu;
+
+                fh = smb2_open(smb2, "qdir-dir", O_RDONLY);
+                if (!fh) {
+                        set_err(err, errlen, smb2, "open qdir-dir failed");
+                        goto out;
+                }
+                memset(&req, 0, sizeof(req));
+                req.file_information_class = classes[i].cls;
+                req.flags = SMB2_RESTART_SCANS;
+                memcpy(req.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+                req.name = "*";
+                req.output_buffer_length = 0x10000;
+
+                memset(&w, 0, sizeof(w));
+                pdu = smb2_cmd_query_directory_async(smb2, &req, qdir_wire_cb, &w);
+                if (!pdu) {
+                        set_err(err, errlen, smb2, classes[i].label);
+                        goto out;
+                }
+                smb2_queue_pdu(smb2, pdu);
+                if (wait_for_cb(smb2, (struct raw_status *)&w) != 0) {
+                        snprintf(err, (size_t)errlen, "%s timed out", classes[i].label);
+                        free(w.buf);
+                        goto out;
+                }
+                smb2_close(smb2, fh);
+                fh = NULL;
+                if (w.status != 0) {
+                        snprintf(err, (size_t)errlen, "%s status 0x%x", classes[i].label,
+                                 (unsigned)w.status);
+                        free(w.buf);
+                        goto out;
+                }
+                if (!w.buf) {
+                        snprintf(err, (size_t)errlen, "%s missing output buffer", classes[i].label);
+                        goto out;
+                }
+                if (apple_parse_dir_records(w.buf, w.len, classes[i].hdr, err, errlen) != 0) {
+                        free(w.buf);
+                        goto out;
+                }
+                free(w.buf);
+        }
+
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        if (fh) {
+                smb2_close(smb2, fh);
+        }
+        if (smb2) {
+                smb2_unlink(smb2, "qdir-dir/entry.txt");
+                smb2_rmdir(smb2, "qdir-dir");
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        return rc;
 }
 
 #endif /* DEBUG */

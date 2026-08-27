@@ -14,6 +14,7 @@ C_FORMAT_FILES=(
   Inas/SMB/PathSandbox.c Inas/SMB/PathSandbox.h
   Inas/SMB/DialectPolicy.h
   Inas/SMB/FilesystemShare.c Inas/SMB/FilesystemShare.h
+  Inas/SMB/Srvsvc.c Inas/SMB/Srvsvc.h
   Inas/Services/DiscoveryUDP.c Inas/Services/DiscoveryUDP.h
 )
 CLANG_FORMAT="$(command -v clang-format || true)"

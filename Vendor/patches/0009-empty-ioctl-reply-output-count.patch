@@ -1,0 +1,29 @@
+diff --git a/Vendor/libsmb2/lib/smb2-cmd-ioctl.c b/Vendor/libsmb2/lib/smb2-cmd-ioctl.c
+index 0000000..0000000 100644
+--- a/Vendor/libsmb2/lib/smb2-cmd-ioctl.c
++++ b/Vendor/libsmb2/lib/smb2-cmd-ioctl.c
+@@ -148,6 +148,7 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
+                           struct smb2_ioctl_reply *rep)
+ {
+         int len;
++        uint32_t output_len = 0;
+         uint8_t *buf;
+         struct smb2_iovec *iov, *ioctlv;
+ 
+@@ -219,6 +220,7 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
+                         }
+                         break;
+                 }
++                output_len = (uint32_t)len;
+         }
+ 
+         smb2_set_uint16(iov, 0, SMB2_IOCTL_REPLY_SIZE);
+@@ -233,7 +235,7 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
+                         (SMB2_IOCTL_REPLY_SIZE & 0xfffffffe) +
+                         PAD_TO_64BIT(rep->input_count));
+         /* output_count */
+-        smb2_set_uint32(iov, 36, len);
++        smb2_set_uint32(iov, 36, output_len);
+         smb2_set_uint32(iov, 40, rep->flags);
+ 
+         return 0;

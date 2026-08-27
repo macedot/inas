@@ -1,0 +1,179 @@
+diff --git a/Vendor/libsmb2/include/smb2/smb2-errors.h b/Users/thiago/Projects/inas/Vendor/libsmb2/include/smb2/smb2-errors.h
+index 783ecbb..1ff2ba2 100644
+--- a/Vendor/libsmb2/include/smb2/smb2-errors.h
++++ b/Vendor/libsmb2/include/smb2/smb2-errors.h
+@@ -36,6 +36,7 @@
+ #define SMB2_STATUS_SUCCESS                            0x00000000
+ #define SMB2_STATUS_SHUTDOWN                           0xffffffff
+ #define SMB2_STATUS_PENDING                            0x00000103
++#define SMB2_STATUS_NOTIFY_ENUM_DIR                    0x000C10B8
+ #define SMB2_STATUS_SMB_BAD_FID                        0x00060001
+ #define SMB2_STATUS_NO_MORE_FILES                      0x80000006
+ #define SMB2_STATUS_UNSUCCESSFUL                       0xC0000001
+diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Users/thiago/Projects/inas/Vendor/libsmb2/lib/libsmb2.c
+index a7ad468..9d38b60 100644
+--- a/Vendor/libsmb2/lib/libsmb2.c
++++ b/Vendor/libsmb2/lib/libsmb2.c
+@@ -3476,12 +3476,59 @@ smb2_server_status_from_errno(enum smb2_command cmd, int ret)
+                 return SMB2_STATUS_INVALID_PARAMETER;
+         case EBADF:
+                 return SMB2_STATUS_FILE_CLOSED;
++        case ENOMSG:
++                if (cmd == SMB2_CHANGE_NOTIFY) {
++                        return SMB2_STATUS_NOTIFY_ENUM_DIR;
++                }
++                return SMB2_STATUS_NOT_SUPPORTED;
+         case ENOSYS:
+         default:
+                 return SMB2_STATUS_NOT_SUPPORTED;
+         }
+ }
+ 
++/* Server-side error log. Surfaces handler errnos and stalled (NULL)
++ * reply PDUs to stderr so they are visible in the iOS device Console
++ * without a packet capture. Kept short, one line, low volume. */
++static const char *
++smb2_server_cmd_name(enum smb2_command cmd)
++{
++        switch (cmd) {
++        case SMB2_NEGOTIATE:       return "NEGOTIATE";
++        case SMB2_SESSION_SETUP:   return "SESSION_SETUP";
++        case SMB2_LOGOFF:          return "LOGOFF";
++        case SMB2_TREE_CONNECT:    return "TREE_CONNECT";
++        case SMB2_TREE_DISCONNECT: return "TREE_DISCONNECT";
++        case SMB2_CREATE:          return "CREATE";
++        case SMB2_CLOSE:           return "CLOSE";
++        case SMB2_FLUSH:           return "FLUSH";
++        case SMB2_READ:            return "READ";
++        case SMB2_WRITE:           return "WRITE";
++        case SMB2_LOCK:            return "LOCK";
++        case SMB2_IOCTL:           return "IOCTL";
++        case SMB2_CANCEL:          return "CANCEL";
++        case SMB2_ECHO:            return "ECHO";
++        case SMB2_QUERY_DIRECTORY: return "QUERY_DIRECTORY";
++        case SMB2_CHANGE_NOTIFY:   return "CHANGE_NOTIFY";
++        case SMB2_QUERY_INFO:      return "QUERY_INFO";
++        case SMB2_SET_INFO:        return "SET_INFO";
++        case SMB2_OPLOCK_BREAK:    return "OPLOCK_BREAK";
++        default:                   return "UNKNOWN";
++        }
++}
++
++static void
++smb2_server_log_err(enum smb2_command cmd, int ret, struct smb2_pdu *pdu)
++{
++        if (ret >= 0 && pdu != NULL) {
++                return;
++        }
++        fprintf(stderr, "inas-smb: cmd=%s errno=%d status=0x%08x reply_pdu=%s\n",
++                smb2_server_cmd_name(cmd), ret < 0 ? -ret : 0,
++                ret < 0 ? smb2_server_status_from_errno(cmd, ret) : 0,
++                pdu == NULL ? "NULL" : "ok");
++}
++
+ static void
+ smb2_logoff_request_cb(struct smb2_server *server, struct smb2_context *smb2, void *command_data, void *cb_data)
+ {
+@@ -3579,6 +3626,12 @@ smb2_create_request_cb(struct smb2_server *server, struct smb2_context *smb2, vo
+                 memcpy(smb2->compound_fid, rep.file_id, SMB2_FD_SIZE);
+                 smb2->compound_fid_valid = 1;
+                 pdu = smb2_cmd_create_reply_async(smb2, &rep, NULL, cb_data);
++                if (pdu == NULL) {
++                        memset(&err, 0, sizeof(err));
++                        pdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_CREATE,
++                                                         SMB2_STATUS_UNSUCCESSFUL,
++                                                         NULL, cb_data);
++                }
+         }
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+@@ -3592,6 +3645,7 @@ smb2_create_request_cb(struct smb2_server *server, struct smb2_context *smb2, vo
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+                 smb2_queue_pdu(smb2, pdu);
+         }
++        smb2_server_log_err(SMB2_CREATE, ret, pdu);
+ }
+ 
+ static void
+@@ -3895,6 +3949,11 @@ smb2_query_directory_request_cb(struct smb2_server *server, struct smb2_context
+                 }
+                 else {
+                         pdu = smb2_cmd_query_directory_reply_async(smb2, req, &rep, NULL, cb_data);
++                        if (pdu == NULL) {
++                                pdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_QUERY_DIRECTORY,
++                                                                 SMB2_STATUS_UNSUCCESSFUL,
++                                                                 NULL, cb_data);
++                        }
+                 }
+         }
+         if (rep.output_buffer) {
+@@ -3908,6 +3967,7 @@ smb2_query_directory_request_cb(struct smb2_server *server, struct smb2_context
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+                 smb2_queue_pdu(smb2, pdu);
+         }
++        smb2_server_log_err(SMB2_QUERY_DIRECTORY, ret, pdu);
+ }
+ 
+ static void
+@@ -3931,11 +3991,17 @@ smb2_change_notify_request_cb(struct smb2_server *server, struct smb2_context *s
+         }
+         else if (!ret) {
+                 pdu = smb2_cmd_change_notify_reply_async(smb2, &rep, NULL, cb_data);
++                if (pdu == NULL) {
++                        pdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_CHANGE_NOTIFY,
++                                                         SMB2_STATUS_UNSUCCESSFUL,
++                                                         NULL, cb_data);
++                }
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+                 smb2_queue_pdu(smb2, pdu);
+         }
++        smb2_server_log_err(SMB2_CHANGE_NOTIFY, ret, pdu);
+ }
+ 
+ static void
+@@ -3968,6 +4034,11 @@ smb2_query_info_request_cb(struct smb2_server *server, struct smb2_context *smb2
+                 }
+                 else {
+                         pdu = smb2_cmd_query_info_reply_async(smb2, req, &rep, NULL, cb_data);
++                        if (pdu == NULL) {
++                                pdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_QUERY_INFO,
++                                                                 SMB2_STATUS_UNSUCCESSFUL,
++                                                                 NULL, cb_data);
++                        }
+                 }
+         }
+         if (rep.output_buffer) {
+@@ -3978,6 +4049,7 @@ smb2_query_info_request_cb(struct smb2_server *server, struct smb2_context *smb2
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+                 smb2_queue_pdu(smb2, pdu);
+         }
++        smb2_server_log_err(SMB2_QUERY_INFO, ret, pdu);
+ }
+ 
+ static void
+diff --git a/Vendor/libsmb2/lib/smb2-cmd-query-directory.c b/Users/thiago/Projects/inas/Vendor/libsmb2/lib/smb2-cmd-query-directory.c
+index 83b5c07..e06c485 100644
+--- a/Vendor/libsmb2/lib/smb2-cmd-query-directory.c
++++ b/Vendor/libsmb2/lib/smb2-cmd-query-directory.c
+@@ -286,8 +286,17 @@ smb2_encode_query_directory_reply(struct smb2_context *smb2,
+                         if (e.fs->name && e.fs->name[0]) {
+                                 e.name = smb2_utf8_to_utf16(e.fs->name);
+                                 if (e.name == NULL) {
+-                                        smb2_set_error(smb2, "Could not convert name into UTF-16");
+-                                        goto fail_ents;
++                                        /* Bad UTF-8 in a directory entry name
++                                         * would otherwise drop the entire
++                                         * listing into the failure path (silently
++                                         * stalling the client). Skip just this
++                                         * entry so the rest of the directory is
++                                         * still returned. */
++                                        smb2_set_error(smb2,
++                                                "Skipping unencodable directory entry name");
++                                        in_offset += (int)step;
++                                        in_remain -= (int)step;
++                                        continue;
+                                 }
+                                 e.fname_len = 2 * e.name->len;
+                         }

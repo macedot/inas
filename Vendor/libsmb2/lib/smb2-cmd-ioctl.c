@@ -148,6 +148,7 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
                           struct smb2_ioctl_reply *rep)
 {
         int len;
+        uint32_t output_len = 0;
         uint8_t *buf;
         struct smb2_iovec *iov, *ioctlv;
 
@@ -170,6 +171,9 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
                         /* even when passthrough is set we transcode this one
                         */
                         len = SMB2_IOCTL_VALIDIATE_NEGOTIATE_INFO_SIZE;
+                        break;
+                case SMB2_FSCTL_PIPE_TRANSCEIVE:
+                        len = (int)rep->output_count;
                         break;
                 default:
                         if (smb2->passthrough) {
@@ -207,6 +211,10 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
                         smb2_set_uint16(ioctlv, 22, info->dialect);
                         break;
                 }
+                case SMB2_FSCTL_PIPE_TRANSCEIVE:
+                        memcpy(buf, rep->output, rep->output_count);
+                        ioctlv->len = rep->output_count;
+                        break;
                 default:
                         if (smb2->passthrough) {
                                 memcpy(buf, rep->output, rep->output_count);
@@ -219,6 +227,7 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
                         }
                         break;
                 }
+                output_len = (uint32_t)len;
         }
 
         smb2_set_uint16(iov, 0, SMB2_IOCTL_REPLY_SIZE);
@@ -233,7 +242,7 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
                         (SMB2_IOCTL_REPLY_SIZE & 0xfffffffe) +
                         PAD_TO_64BIT(rep->input_count));
         /* output_count */
-        smb2_set_uint32(iov, 36, len);
+        smb2_set_uint32(iov, 36, output_len);
         smb2_set_uint32(iov, 40, rep->flags);
 
         return 0;
@@ -522,6 +531,18 @@ smb2_process_ioctl_request_variable(struct smb2_context *smb2,
                 smb2_get_uint16(&vec, 20, &info->security_mode);
                 smb2_get_uint16(&vec, 22, &info->dialect);
                 req->input_count = sizeof(struct smb2_ioctl_validate_negotiate_info);
+                break;
+        case SMB2_FSCTL_PIPE_TRANSCEIVE:
+                if (req->input_count > vec.len) {
+                        return -EINVAL;
+                }
+                ptr = smb2_alloc_init(smb2, req->input_count ? req->input_count : 1);
+                if (ptr == NULL) {
+                        return -ENOMEM;
+                }
+                if (req->input_count) {
+                        memcpy(ptr, vec.buf, req->input_count);
+                }
                 break;
         default:
                 if (smb2->passthrough) {

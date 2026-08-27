@@ -183,8 +183,11 @@ smb2_encode_query_info_reply(struct smb2_context *smb2,
                 case SMB2_0_INFO_FILE:
                         switch (req->file_info_class) {
                         case SMB2_FILE_ACCESS_INFORMATION:
-                                break;
                         case SMB2_FILE_ALIGNMENT_INFORMATION:
+                                if (rep->output_buffer_length >= 4) {
+                                        memcpy(iov->buf, rep->output_buffer, 4);
+                                        created_output_buffer_length = 4;
+                                }
                                 break;
                         case SMB2_FILE_ALL_INFORMATION:
                                 created_output_buffer_length =
@@ -203,18 +206,37 @@ smb2_encode_query_info_reply(struct smb2_context *smb2,
                         case SMB2_FILE_COMPRESSION_INFORMATION:
                                 break;
                         case SMB2_FILE_EA_INFORMATION:
+                                if (rep->output_buffer_length >= 4) {
+                                        memcpy(iov->buf, rep->output_buffer, 4);
+                                        created_output_buffer_length = 4;
+                                }
                                 break;
                         case SMB2_FILE_FULL_EA_INFORMATION:
                                 break;
                         case SMB2_FILE_ID_INFORMATION:
+                                if (rep->output_buffer_length >= 24) {
+                                        memcpy(iov->buf, rep->output_buffer, 24);
+                                        created_output_buffer_length = 24;
+                                }
+                                break;
+                        case SMB2_FILE_INTERNAL_INFORMATION:
+                                if (rep->output_buffer_length >= 8) {
+                                        memcpy(iov->buf, rep->output_buffer, 8);
+                                        created_output_buffer_length = 8;
+                                }
                                 break;
                         case SMB2_FILE_MODE_INFORMATION:
+                                if (rep->output_buffer_length >= 4) {
+                                        memcpy(iov->buf, rep->output_buffer, 4);
+                                        created_output_buffer_length = 4;
+                                }
                                 break;
                         case SMB2_FILE_NETWORK_OPEN_INFORMATION:
                                 created_output_buffer_length =
                                         smb2_encode_file_network_open_info(smb2,
                                                 (struct smb2_file_network_open_info *)rep->output_buffer, iov);
                                 break;
+                        case SMB2_FILE_NAME_INFORMATION:
                         case SMB2_FILE_NORMALIZED_NAME_INFORMATION:
                                 created_output_buffer_length =
                                         smb2_encode_file_normalized_name_info(smb2,

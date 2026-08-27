@@ -1,0 +1,243 @@
+diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Vendor/libsmb2/lib/libsmb2.c
+--- a/Vendor/libsmb2/lib/libsmb2.c
++++ b/Vendor/libsmb2/lib/libsmb2.c
+@@ -3450,6 +3450,38 @@
+ }
+ 
+ /*************************** server handlers *************************************************************/
++static uint32_t
++smb2_server_status_from_errno(enum smb2_command cmd, int ret)
++{
++        int err;
++
++        if (ret >= 0) {
++                return SMB2_STATUS_SUCCESS;
++        }
++        err = -ret;
++        switch (err) {
++        case ENOENT:
++                if (cmd == SMB2_TREE_CONNECT) {
++                        return SMB2_STATUS_BAD_NETWORK_NAME;
++                }
++                return SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
++        case ENOTDIR:
++                return SMB2_STATUS_NOT_A_DIRECTORY;
++        case EISDIR:
++                return SMB2_STATUS_FILE_IS_A_DIRECTORY;
++        case EACCES:
++        case EPERM:
++                return SMB2_STATUS_ACCESS_DENIED;
++        case EINVAL:
++                return SMB2_STATUS_INVALID_PARAMETER;
++        case EBADF:
++                return SMB2_STATUS_FILE_CLOSED;
++        case ENOSYS:
++        default:
++                return SMB2_STATUS_NOT_SUPPORTED;
++        }
++}
++
+ static void
+ smb2_logoff_request_cb(struct smb2_server *server, struct smb2_context *smb2, void *command_data, void *cb_data)
+ {
+@@ -3466,7 +3498,7 @@
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_LOGOFF, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_LOGOFF, smb2_server_status_from_errno(SMB2_LOGOFF, ret), NULL, cb_data);
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3493,7 +3525,7 @@
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_TREE_CONNECT, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_TREE_CONNECT, smb2_server_status_from_errno(SMB2_TREE_CONNECT, ret), NULL, cb_data);
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3518,7 +3550,7 @@
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_TREE_DISCONNECT, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_TREE_DISCONNECT, smb2_server_status_from_errno(SMB2_TREE_DISCONNECT, ret), NULL, cb_data);
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3551,7 +3583,7 @@
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_CREATE, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_CREATE, smb2_server_status_from_errno(SMB2_CREATE, ret), NULL, cb_data);
+         }
+         if (pdu) {
+                 if (req->name) {
+@@ -3581,7 +3613,7 @@
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_CLOSE, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_CLOSE, smb2_server_status_from_errno(SMB2_CLOSE, ret), NULL, cb_data);
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3606,7 +3638,7 @@
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_FLUSH, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_FLUSH, smb2_server_status_from_errno(SMB2_FLUSH, ret), NULL, cb_data);
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3633,7 +3665,7 @@
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_READ, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_READ, smb2_server_status_from_errno(SMB2_READ, ret), NULL, cb_data);
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3660,7 +3692,7 @@
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_WRITE, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_WRITE, smb2_server_status_from_errno(SMB2_WRITE, ret), NULL, cb_data);
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3704,7 +3736,7 @@
+         if(ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_LOCK, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_LOCK, smb2_server_status_from_errno(SMB2_LOCK, ret), NULL, cb_data);
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3729,7 +3761,7 @@
+         else if(ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_LOCK, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_LOCK, smb2_server_status_from_errno(SMB2_LOCK, ret), NULL, cb_data);
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3775,8 +3807,12 @@
+                 else if (ret < 0) {
+                         memset(&err, 0, sizeof(err));
+                         pdu = smb2_cmd_error_reply_async(smb2,
+-                                        &err, SMB2_IOCTL, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                        &err, SMB2_IOCTL, smb2_server_status_from_errno(SMB2_IOCTL, ret), NULL, cb_data);
+                 }
++                if (req->ctl_code == SMB2_FSCTL_PIPE_TRANSCEIVE && req->input) {
++                        smb2_free_data(smb2, discard_const(req->input));
++                        req->input = NULL;
++                }
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3797,7 +3833,7 @@
+         if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_CANCEL, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_CANCEL, smb2_server_status_from_errno(SMB2_CANCEL, ret), NULL, cb_data);
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3821,7 +3857,7 @@
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_ECHO, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_ECHO, smb2_server_status_from_errno(SMB2_ECHO, ret), NULL, cb_data);
+         }
+         if (pdu != NULL) {
+                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
+@@ -3846,7 +3882,7 @@
+         }
+         if (ret < 0) {
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_QUERY_DIRECTORY, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_QUERY_DIRECTORY, smb2_server_status_from_errno(SMB2_QUERY_DIRECTORY, ret), NULL, cb_data);
+         }
+         else if (!ret) {
+                 if (rep.output_buffer_length == 0) {
+@@ -3891,7 +3927,7 @@
+         }
+         if (ret < 0) {
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_CHANGE_NOTIFY, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_CHANGE_NOTIFY, smb2_server_status_from_errno(SMB2_CHANGE_NOTIFY, ret), NULL, cb_data);
+         }
+         else if (!ret) {
+                 pdu = smb2_cmd_change_notify_reply_async(smb2, &rep, NULL, cb_data);
+@@ -3919,7 +3955,7 @@
+         }
+         if (ret < 0) {
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_QUERY_INFO, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_QUERY_INFO, smb2_server_status_from_errno(SMB2_QUERY_INFO, ret), NULL, cb_data);
+         }
+         else if (!ret) {
+                 if (rep.output_buffer_length == 0) {
+@@ -3959,7 +3995,7 @@
+         }
+         if (ret < 0) {
+                 pdu = smb2_cmd_error_reply_async(smb2,
+-                                &err, SMB2_SET_INFO, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
++                                &err, SMB2_SET_INFO, smb2_server_status_from_errno(SMB2_SET_INFO, ret), NULL, cb_data);
+         }
+         else if (!ret) {
+                 pdu = smb2_cmd_set_info_reply_async(smb2, req, NULL, cb_data);
+diff --git a/Vendor/libsmb2/lib/smb2-cmd-ioctl.c b/Vendor/libsmb2/lib/smb2-cmd-ioctl.c
+--- a/Vendor/libsmb2/lib/smb2-cmd-ioctl.c
++++ b/Vendor/libsmb2/lib/smb2-cmd-ioctl.c
+@@ -172,6 +172,9 @@
+                         */
+                         len = SMB2_IOCTL_VALIDIATE_NEGOTIATE_INFO_SIZE;
+                         break;
++                case SMB2_FSCTL_PIPE_TRANSCEIVE:
++                        len = (int)rep->output_count;
++                        break;
+                 default:
+                         if (smb2->passthrough) {
+                                 /* assume the replys output is already coded */
+@@ -208,6 +211,10 @@
+                         smb2_set_uint16(ioctlv, 22, info->dialect);
+                         break;
+                 }
++                case SMB2_FSCTL_PIPE_TRANSCEIVE:
++                        memcpy(buf, rep->output, rep->output_count);
++                        ioctlv->len = rep->output_count;
++                        break;
+                 default:
+                         if (smb2->passthrough) {
+                                 memcpy(buf, rep->output, rep->output_count);
+@@ -525,6 +532,18 @@
+                 smb2_get_uint16(&vec, 22, &info->dialect);
+                 req->input_count = sizeof(struct smb2_ioctl_validate_negotiate_info);
+                 break;
++        case SMB2_FSCTL_PIPE_TRANSCEIVE:
++                if (req->input_count > vec.len) {
++                        return -EINVAL;
++                }
++                ptr = smb2_alloc_init(smb2, req->input_count ? req->input_count : 1);
++                if (ptr == NULL) {
++                        return -ENOMEM;
++                }
++                if (req->input_count) {
++                        memcpy(ptr, vec.buf, req->input_count);
++                }
++                break;
+         default:
+                 if (smb2->passthrough) {
+                         /* dont know how to handle this, let user decode it */

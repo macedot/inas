@@ -64,6 +64,12 @@ final class ShareController {
         credentials = store.load()
         extras = shareStore.load()
         seedDocumentsIfNeeded()
+        #if DEBUG
+        // Simulator testing: boot straight into sharing without UI taps.
+        if ProcessInfo.processInfo.environment["INAS_SIM_AUTOSTART"] == "1" {
+            start()
+        }
+        #endif
         if registerBackground {
             registerBackgroundTask()
             NotificationCenter.default.addObserver(
@@ -93,10 +99,36 @@ final class ShareController {
     }
 
     func start() {
-        guard !state.isBusy else { return }
-        guard let ip = lan.lanIPv4() else {
-            state = .failed(SMBServerError.noWiFi.localizedDescription)
+        #if DEBUG
+        // Simulator/device testing: INAS_SIM_BIND_IP skips the Wi-Fi check
+        // ("any" binds every interface), INAS_SIM_USER / INAS_SIM_PASSWORD
+        // pin credentials for scripted clients.
+        let sim = ProcessInfo.processInfo.environment
+        if var simIP = sim["INAS_SIM_BIND_IP"], !simIP.isEmpty {
+            if simIP == "any" {
+                simIP = ""
+            }
+            if let simUser = sim["INAS_SIM_USER"], !simUser.isEmpty {
+                credentials.username = simUser
+            }
+            start(overrideIP: simIP, overridePassword: sim["INAS_SIM_PASSWORD"])
             return
+        }
+        #endif
+        start(overrideIP: nil, overridePassword: nil)
+    }
+
+    private func start(overrideIP: String?, overridePassword: String?) {
+        guard !state.isBusy else { return }
+        let ip: String
+        if let overrideIP {
+            ip = overrideIP
+        } else {
+            guard let lanIP = lan.lanIPv4() else {
+                state = .failed(SMBServerError.noWiFi.localizedDescription)
+                return
+            }
+            ip = lanIP
         }
         let username = credentials.username.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !username.isEmpty else {
@@ -106,14 +138,19 @@ final class ShareController {
         credentials.username = username
         let password: String
         do {
-            let session = try store.passwordForStart(credentials)
-            credentials = session.credentials
-            password = session.password
+            if let overridePassword {
+                password = overridePassword
+            } else {
+                let session = try store.passwordForStart(credentials)
+                credentials = session.credentials
+                password = session.password
+            }
         } catch {
             state = .failed("Could not store the password.")
             return
         }
         persistShares()
+        seedDocumentsIfNeeded()
         let live = shareStore.resolveForStart(documents: documentsURL, extras: extras)
         scopedRoots = live.filter(\.scoped).map(\.root)
         state = .starting
@@ -264,11 +301,18 @@ final class ShareController {
     }
 
     private func beginStats() {
+        #if DEBUG
+        // Simulator testing: endpoint is pinned to 127.0.0.1 which the LAN
+        // probe will never report, so skip its "left Wi-Fi" auto-stop.
+        let simNoWatchdog = ProcessInfo.processInfo.environment["INAS_SIM_AUTOSTART"] == "1"
+        #else
+        let simNoWatchdog = false
+        #endif
         statsTimer?.invalidate()
         statsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                if let expected = self.endpoint?.ip, self.lan.lanIPv4() != expected {
+                if !simNoWatchdog, let expected = self.endpoint?.ip, self.lan.lanIPv4() != expected {
                     self.stop(notify: true)
                     return
                 }
@@ -311,7 +355,9 @@ final class ShareController {
     }
 
     private func seedDocumentsIfNeeded() {
-        let readme = documentsURL.appendingPathComponent("README.txt")
+        let docs = documentsURL
+        try? FileManager.default.createDirectory(at: docs, withIntermediateDirectories: true)
+        let readme = docs.appendingPathComponent("README.txt")
         guard !FileManager.default.fileExists(atPath: readme.path) else { return }
         let text = """
         iNAS share

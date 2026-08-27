@@ -7,7 +7,7 @@
 # libsmb2-6.1 checkout.
 #
 # iNAS changes after the import live in Vendor/patches/ as a numbered
-# series (currently 0001–0008). Scripts/vendor-check.sh applies them to
+# series (currently 0001–0013). Scripts/vendor-check.sh applies them to
 # the baseline and requires the result to match Vendor/libsmb2.
 
 BASELINE_COMMIT=fa52e91

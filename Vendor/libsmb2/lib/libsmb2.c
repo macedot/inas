@@ -3450,6 +3450,117 @@ int smb2_notify_change_async(struct smb2_context *smb2, const char *path, uint16
 }
 
 /*************************** server handlers *************************************************************/
+static uint32_t
+smb2_server_status_from_errno(enum smb2_command cmd, int ret)
+{
+        int err;
+
+        if (ret >= 0) {
+                return SMB2_STATUS_SUCCESS;
+        }
+        err = -ret;
+        switch (err) {
+        case ENOENT:
+                if (cmd == SMB2_TREE_CONNECT) {
+                        return SMB2_STATUS_BAD_NETWORK_NAME;
+                }
+                return SMB2_STATUS_OBJECT_NAME_NOT_FOUND;
+        case ENOTDIR:
+                return SMB2_STATUS_NOT_A_DIRECTORY;
+        case EISDIR:
+                return SMB2_STATUS_FILE_IS_A_DIRECTORY;
+        case EACCES:
+        case EPERM:
+                return SMB2_STATUS_ACCESS_DENIED;
+        case EINVAL:
+                return SMB2_STATUS_INVALID_PARAMETER;
+        case EBADF:
+                return SMB2_STATUS_FILE_CLOSED;
+        case ENOMEM:
+                return SMB2_STATUS_INSUFFICIENT_RESOURCES;
+        case ENOMSG:
+                if (cmd == SMB2_CHANGE_NOTIFY) {
+                        return SMB2_STATUS_NOTIFY_ENUM_DIR;
+                }
+                return SMB2_STATUS_NOT_SUPPORTED;
+        case ENOSYS:
+        default:
+                return SMB2_STATUS_NOT_SUPPORTED;
+        }
+}
+
+/* Server-side error log. Surfaces handler errnos and stalled (NULL)
+ * reply PDUs so they are visible in the iOS/macOS Console without a
+ * packet capture. Kept short, one line, low volume. */
+static const char *
+smb2_server_cmd_name(enum smb2_command cmd)
+{
+        switch (cmd) {
+        case SMB2_NEGOTIATE:       return "NEGOTIATE";
+        case SMB2_SESSION_SETUP:   return "SESSION_SETUP";
+        case SMB2_LOGOFF:          return "LOGOFF";
+        case SMB2_TREE_CONNECT:    return "TREE_CONNECT";
+        case SMB2_TREE_DISCONNECT: return "TREE_DISCONNECT";
+        case SMB2_CREATE:          return "CREATE";
+        case SMB2_CLOSE:           return "CLOSE";
+        case SMB2_FLUSH:           return "FLUSH";
+        case SMB2_READ:            return "READ";
+        case SMB2_WRITE:           return "WRITE";
+        case SMB2_LOCK:            return "LOCK";
+        case SMB2_IOCTL:           return "IOCTL";
+        case SMB2_CANCEL:          return "CANCEL";
+        case SMB2_ECHO:            return "ECHO";
+        case SMB2_QUERY_DIRECTORY: return "QUERY_DIRECTORY";
+        case SMB2_CHANGE_NOTIFY:   return "CHANGE_NOTIFY";
+        case SMB2_QUERY_INFO:      return "QUERY_INFO";
+        case SMB2_SET_INFO:        return "SET_INFO";
+        case SMB2_OPLOCK_BREAK:    return "OPLOCK_BREAK";
+        default:                   return "UNKNOWN";
+        }
+}
+
+#ifdef __APPLE__
+#include <os/log.h>
+static void
+smb2_server_log_line(const char *line)
+{
+        os_log_debug(OS_LOG_DEFAULT, "inas-smb: %{public}s", line);
+}
+#else
+static void
+smb2_server_log_line(const char *line)
+{
+        fprintf(stderr, "inas-smb: %s\n", line);
+}
+#endif
+
+static void
+smb2_server_log_err(enum smb2_command cmd, int ret, struct smb2_pdu *pdu)
+{
+        char line[128];
+
+        if (ret >= 0 && pdu != NULL) {
+                return;
+        }
+        snprintf(line, sizeof(line), "cmd=%s errno=%d status=0x%08x reply_pdu=%s",
+                 smb2_server_cmd_name(cmd), ret < 0 ? -ret : 0,
+                 ret < 0 ? smb2_server_status_from_errno(cmd, ret) : 0,
+                 pdu == NULL ? "NULL" : "ok");
+        smb2_server_log_line(line);
+}
+
+/* Always-on one-line trace for commands implicated in client teardowns
+ * (SET_INFO / CHANGE_NOTIFY). Trailing spaces trimmed by the reader. */
+static void
+smb2_server_log_trace(enum smb2_command cmd, int a, int b)
+{
+        char line[128];
+
+        snprintf(line, sizeof(line), "trace cmd=%s a=%d b=%d",
+                 smb2_server_cmd_name(cmd), a, b);
+        smb2_server_log_line(line);
+}
+
 static void
 smb2_logoff_request_cb(struct smb2_server *server, struct smb2_context *smb2, void *command_data, void *cb_data)
 {
@@ -3466,7 +3577,7 @@ smb2_logoff_request_cb(struct smb2_server *server, struct smb2_context *smb2, vo
         else if (ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_LOGOFF, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_LOGOFF, smb2_server_status_from_errno(SMB2_LOGOFF, ret), NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -3493,7 +3604,7 @@ smb2_tree_connect_request_cb(struct smb2_server *server, struct smb2_context *sm
         else if (ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_TREE_CONNECT, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_TREE_CONNECT, smb2_server_status_from_errno(SMB2_TREE_CONNECT, ret), NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -3518,7 +3629,7 @@ smb2_tree_disconnect_request_cb(struct smb2_server *server, struct smb2_context 
         else if (ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_TREE_DISCONNECT, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_TREE_DISCONNECT, smb2_server_status_from_errno(SMB2_TREE_DISCONNECT, ret), NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -3547,11 +3658,17 @@ smb2_create_request_cb(struct smb2_server *server, struct smb2_context *smb2, vo
                 memcpy(smb2->compound_fid, rep.file_id, SMB2_FD_SIZE);
                 smb2->compound_fid_valid = 1;
                 pdu = smb2_cmd_create_reply_async(smb2, &rep, NULL, cb_data);
+                if (pdu == NULL) {
+                        memset(&err, 0, sizeof(err));
+                        pdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_CREATE,
+                                                         SMB2_STATUS_UNSUCCESSFUL,
+                                                         NULL, cb_data);
+                }
         }
         else if (ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_CREATE, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_CREATE, smb2_server_status_from_errno(SMB2_CREATE, ret), NULL, cb_data);
         }
         if (pdu) {
                 if (req->name) {
@@ -3560,6 +3677,7 @@ smb2_create_request_cb(struct smb2_server *server, struct smb2_context *smb2, vo
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
                 smb2_queue_pdu(smb2, pdu);
         }
+        smb2_server_log_err(SMB2_CREATE, ret, pdu);
 }
 
 static void
@@ -3581,7 +3699,7 @@ smb2_close_request_cb(struct smb2_server *server, struct smb2_context *smb2, voi
         else if (ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_CLOSE, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_CLOSE, smb2_server_status_from_errno(SMB2_CLOSE, ret), NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -3606,7 +3724,7 @@ smb2_flush_request_cb(struct smb2_server *server, struct smb2_context *smb2, voi
         else if (ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_FLUSH, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_FLUSH, smb2_server_status_from_errno(SMB2_FLUSH, ret), NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -3633,7 +3751,7 @@ smb2_read_request_cb(struct smb2_server *server, struct smb2_context *smb2, void
         else if (ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_READ, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_READ, smb2_server_status_from_errno(SMB2_READ, ret), NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -3660,7 +3778,7 @@ smb2_write_request_cb(struct smb2_server *server, struct smb2_context *smb2, voi
         else if (ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_WRITE, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_WRITE, smb2_server_status_from_errno(SMB2_WRITE, ret), NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -3704,7 +3822,7 @@ smb2_oplock_break_request_cb(struct smb2_server *server, struct smb2_context *sm
         if(ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_LOCK, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_LOCK, smb2_server_status_from_errno(SMB2_LOCK, ret), NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -3729,7 +3847,7 @@ smb2_lock_request_cb(struct smb2_server *server, struct smb2_context *smb2, void
         else if(ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_LOCK, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_LOCK, smb2_server_status_from_errno(SMB2_LOCK, ret), NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -3775,7 +3893,11 @@ smb2_ioctl_request_cb(struct smb2_server *server, struct smb2_context *smb2, voi
                 else if (ret < 0) {
                         memset(&err, 0, sizeof(err));
                         pdu = smb2_cmd_error_reply_async(smb2,
-                                        &err, SMB2_IOCTL, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                        &err, SMB2_IOCTL, smb2_server_status_from_errno(SMB2_IOCTL, ret), NULL, cb_data);
+                }
+                if (req->ctl_code == SMB2_FSCTL_PIPE_TRANSCEIVE && req->input) {
+                        smb2_free_data(smb2, discard_const(req->input));
+                        req->input = NULL;
                 }
         }
         if (pdu != NULL) {
@@ -3797,7 +3919,7 @@ smb2_cancel_request_cb(struct smb2_server *server, struct smb2_context *smb2, vo
         if (ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_CANCEL, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_CANCEL, smb2_server_status_from_errno(SMB2_CANCEL, ret), NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -3821,7 +3943,7 @@ smb2_echo_request_cb(struct smb2_server *server, struct smb2_context *smb2, void
         else if (ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_ECHO, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_ECHO, smb2_server_status_from_errno(SMB2_ECHO, ret), NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -3846,7 +3968,7 @@ smb2_query_directory_request_cb(struct smb2_server *server, struct smb2_context 
         }
         if (ret < 0) {
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_QUERY_DIRECTORY, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_QUERY_DIRECTORY, smb2_server_status_from_errno(SMB2_QUERY_DIRECTORY, ret), NULL, cb_data);
         }
         else if (!ret) {
                 if (rep.output_buffer_length == 0) {
@@ -3859,6 +3981,11 @@ smb2_query_directory_request_cb(struct smb2_server *server, struct smb2_context 
                 }
                 else {
                         pdu = smb2_cmd_query_directory_reply_async(smb2, req, &rep, NULL, cb_data);
+                        if (pdu == NULL) {
+                                pdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_QUERY_DIRECTORY,
+                                                                 SMB2_STATUS_UNSUCCESSFUL,
+                                                                 NULL, cb_data);
+                        }
                 }
         }
         if (rep.output_buffer) {
@@ -3872,6 +3999,7 @@ smb2_query_directory_request_cb(struct smb2_server *server, struct smb2_context 
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
                 smb2_queue_pdu(smb2, pdu);
         }
+        smb2_server_log_err(SMB2_QUERY_DIRECTORY, ret, pdu);
 }
 
 static void
@@ -3891,15 +4019,22 @@ smb2_change_notify_request_cb(struct smb2_server *server, struct smb2_context *s
         }
         if (ret < 0) {
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_CHANGE_NOTIFY, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_CHANGE_NOTIFY, smb2_server_status_from_errno(SMB2_CHANGE_NOTIFY, ret), NULL, cb_data);
         }
         else if (!ret) {
                 pdu = smb2_cmd_change_notify_reply_async(smb2, &rep, NULL, cb_data);
+                if (pdu == NULL) {
+                        pdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_CHANGE_NOTIFY,
+                                                         SMB2_STATUS_UNSUCCESSFUL,
+                                                         NULL, cb_data);
+                }
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
                 smb2_queue_pdu(smb2, pdu);
         }
+        smb2_server_log_trace(SMB2_CHANGE_NOTIFY, req->completion_filter, ret);
+        smb2_server_log_err(SMB2_CHANGE_NOTIFY, ret, pdu);
 }
 
 static void
@@ -3919,7 +4054,7 @@ smb2_query_info_request_cb(struct smb2_server *server, struct smb2_context *smb2
         }
         if (ret < 0) {
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_QUERY_INFO, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_QUERY_INFO, smb2_server_status_from_errno(SMB2_QUERY_INFO, ret), NULL, cb_data);
         }
         else if (!ret) {
                 if (rep.output_buffer_length == 0) {
@@ -3932,6 +4067,11 @@ smb2_query_info_request_cb(struct smb2_server *server, struct smb2_context *smb2
                 }
                 else {
                         pdu = smb2_cmd_query_info_reply_async(smb2, req, &rep, NULL, cb_data);
+                        if (pdu == NULL) {
+                                pdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_QUERY_INFO,
+                                                                 SMB2_STATUS_UNSUCCESSFUL,
+                                                                 NULL, cb_data);
+                        }
                 }
         }
         if (rep.output_buffer) {
@@ -3942,6 +4082,7 @@ smb2_query_info_request_cb(struct smb2_server *server, struct smb2_context *smb2
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
                 smb2_queue_pdu(smb2, pdu);
         }
+        smb2_server_log_err(SMB2_QUERY_INFO, ret, pdu);
 }
 
 static void
@@ -3957,17 +4098,24 @@ smb2_set_info_request_cb(struct smb2_server *server, struct smb2_context *smb2, 
         if (server->handlers && server->handlers->set_info_cmd) {
                 ret = server->handlers->set_info_cmd(server, smb2, req);
         }
+        smb2_server_log_trace(SMB2_SET_INFO, req->file_info_class, ret);
         if (ret < 0) {
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_SET_INFO, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_SET_INFO, smb2_server_status_from_errno(SMB2_SET_INFO, ret), NULL, cb_data);
         }
         else if (!ret) {
                 pdu = smb2_cmd_set_info_reply_async(smb2, req, NULL, cb_data);
+                if (pdu == NULL) {
+                        pdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_SET_INFO,
+                                                         SMB2_STATUS_UNSUCCESSFUL,
+                                                         NULL, cb_data);
+                }
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
                 smb2_queue_pdu(smb2, pdu);
         }
+        smb2_server_log_err(SMB2_SET_INFO, ret, pdu);
 }
 
 static void
