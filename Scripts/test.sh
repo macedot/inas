@@ -62,15 +62,9 @@ PY
 DESTINATION="${DESTINATION:-$(pick_destination)}"
 echo "xcodebuild test destination: $DESTINATION"
 
-SIGNING_ARG=""
-if [[ "${CI:-}" == "true" ]]; then
-  SIGNING_ARG="CODE_SIGNING_ALLOWED=NO"
-fi
-
 xcodebuild \
   -project Inas.xcodeproj \
   -scheme Inas \
   -destination "$DESTINATION" \
   -skipPackagePluginValidation \
-  $SIGNING_ARG \
   test
