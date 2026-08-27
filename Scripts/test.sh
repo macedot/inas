@@ -72,6 +72,5 @@ xcodebuild \
   -scheme Inas \
   -destination "$DESTINATION" \
   -skipPackagePluginValidation \
-  -collect-test-diagnostics never \
   $SIGNING_ARG \
   test

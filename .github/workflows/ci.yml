@@ -9,10 +9,14 @@ jobs:
   test:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          xcrun simctl list runtimes available
       - name: Vendor patches, tests
         run: Scripts/test.sh
