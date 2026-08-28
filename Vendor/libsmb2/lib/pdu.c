@@ -698,8 +698,16 @@ smb2_queue_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu)
                         prev_compound_mid = p->header.message_id;
                 }
 
-                if (smb2->sign ||
-                    (p->header.command == SMB2_TREE_CONNECT && smb2->dialect == SMB2_VERSION_0311 && !smb2->seal)) {
+                /*
+                 * Sealed PDUs do not need a signature: the CCM transform
+                 * already authenticates the whole message (MS-SMB2 allows
+                 * unsigned+encrypted), and signing is a full extra pass
+                 * over the payload. Negotiate/session-setup are never
+                 * sealed and keep the preauth-hash-relevant signature.
+                 */
+                if (!(smb2->seal && p->seal) &&
+                    (smb2->sign ||
+                     (p->header.command == SMB2_TREE_CONNECT && smb2->dialect == SMB2_VERSION_0311 && !smb2->seal))) {
                         if (smb2_pdu_add_signature(smb2, p) < 0) {
                                 smb2_set_error(smb2, "Failure to add "
                                                "signature. %s",
