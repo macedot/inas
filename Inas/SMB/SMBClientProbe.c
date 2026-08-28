@@ -2107,4 +2107,67 @@ out:
         return rc;
 }
 
+int inas_smb_client_setinfo_times(const char *host, uint16_t port, const char *user,
+                                  const char *password, const char *share, char *err, int errlen)
+{
+        struct smb2_context *smb2;
+        struct smb2fh *fh;
+        struct smb2_set_info_request sr;
+        struct smb2_file_basic_info bi;
+        struct smb2_stat_64 st;
+        struct raw_status rs;
+        const time_t want = 1600000000;
+        int rc = -1;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+        fh = smb2_open(smb2, "si-time.txt", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create si-time.txt failed");
+                goto out;
+        }
+        memset(&bi, 0, sizeof(bi));
+        bi.last_write_time.tv_sec = want;
+        bi.last_write_time.tv_usec = 0;
+        memset(&sr, 0, sizeof(sr));
+        sr.info_type = SMB2_0_INFO_FILE;
+        sr.file_info_class = SMB2_FILE_BASIC_INFORMATION;
+        memcpy(sr.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        sr.input_data = &bi;
+        if (run_until_status(smb2, smb2_cmd_set_info_async(smb2, &sr, raw_cb, &rs), &rs,
+                             "FileBasicInformation", err, errlen) != 0) {
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        if (rs.status != 0) {
+                snprintf(err, (size_t)errlen, "FileBasicInformation status 0x%x",
+                         (unsigned)rs.status);
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        memset(&st, 0, sizeof(st));
+        if (smb2_fstat(smb2, fh, &st) != 0) {
+                set_err(err, errlen, smb2, "fstat si-time.txt failed");
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        if (st.smb2_mtime != (uint64_t)want) {
+                snprintf(err, (size_t)errlen, "mtime %llu want %ld",
+                         (unsigned long long)st.smb2_mtime, (long)want);
+                goto out;
+        }
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        if (smb2) {
+                smb2_unlink(smb2, "si-time.txt");
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        return rc;
+}
+
 #endif /* DEBUG */

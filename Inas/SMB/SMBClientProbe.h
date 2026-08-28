@@ -120,6 +120,10 @@ int inas_smb_client_two_sessions_count(const char *host, uint16_t port, const ch
                                        const char *password, const char *share, char *err,
                                        int errlen);
 
+/* SET_INFO FileBasicInformation last_write_time must round-trip on QUERY_INFO. */
+int inas_smb_client_setinfo_times(const char *host, uint16_t port, const char *user,
+                                  const char *password, const char *share, char *err, int errlen);
+
 #endif /* DEBUG */
 
 #ifdef __cplusplus

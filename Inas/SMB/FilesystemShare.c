@@ -44,6 +44,7 @@
 
 #ifdef __APPLE__
 #include <os/log.h>
+#include <sys/attr.h>
 #endif
 
 #define INAS_MAX_HANDLES 256
@@ -63,24 +64,6 @@ struct inas_io_target {
         int dead;
         int refs;
         int in_use;
-};
-
-struct inas_io_completion {
-        struct inas_io_target *target;
-        struct inas_io_completion *next;
-        uint64_t message_id;
-        int is_read;
-        int fd;          /* dup'd file descriptor, owned by the op */
-        uint64_t offset; /* file offset for the I/O */
-        int status;      /* >=0 bytes transferred, <0 -errno */
-        uint8_t *buf;    /* read: worker-allocated data; write: copied data */
-        uint32_t length; /* requested transfer size */
-};
-
-struct inas_share {
-        char name[64];
-        char root[PATH_MAX];
-        int rootfd;
 };
 
 struct inas_handle {
@@ -111,6 +94,34 @@ struct inas_handle {
         uint8_t *rpc_out;
         size_t rpc_out_len;
         size_t rpc_out_off;
+};
+
+enum inas_io_kind {
+        IO_READ = 0,
+        IO_WRITE = 1,
+        IO_SETINFO = 3,
+};
+
+struct inas_io_completion {
+        struct inas_io_target *target;
+        struct inas_io_completion *next;
+        uint64_t message_id;
+        int kind;
+        int is_read;
+        int fd;          /* dup'd file descriptor, owned by the op */
+        uint64_t offset; /* file offset for the I/O */
+        int status;      /* >=0 bytes transferred, <0 -errno */
+        uint8_t *buf;    /* read: worker-allocated data; write: copied data */
+        uint32_t length; /* requested transfer size */
+        /* SETINFO: worker applies times via fd or rootfd+leaf (cr_name). */
+        int rootfd;
+        char *cr_name;
+};
+
+struct inas_share {
+        char name[64];
+        char root[PATH_MAX];
+        int rootfd;
 };
 
 struct inas_state {
@@ -156,6 +167,15 @@ struct inas_state {
 };
 
 static struct inas_state g;
+
+static int open_path(struct inas_handle *h, int rootfd, const char *smb_name,
+                     struct smb2_create_request *req, struct stat *st);
+static int handle_free(struct inas_state *fs, struct inas_handle *h, int send_notify);
+static void notify_mark(struct inas_state *fs);
+static struct inas_handle *handle_lookup(struct inas_state *fs, const smb2_file_id id);
+static uint64_t timespec_to_smb(const struct timespec *ts);
+static uint32_t stat_to_attrs(const struct stat *st);
+static int apply_basic_times(struct inas_handle *h, struct smb2_file_basic_info *b);
 
 static struct inas_state *fs_state(struct smb2_server *srvr)
 {
@@ -246,6 +266,14 @@ static void io_op_start(struct inas_state *fs, struct inas_io_completion *op)
         dispatch_async_f(fs->io_worker_queue, op, io_worker);
 }
 
+/* Related compounds must stay on the serve thread: follow-up commands
+ * (CREATE+CLOSE, WRITE+CLOSE, CREATE+QUERY) share compound_fid and must
+ * be answered in order. Standalone PDUs can run on the worker pool. */
+static int io_can_defer(struct inas_state *fs, struct smb2_context *smb2)
+{
+        return fs->io_worker_queue != NULL && !smb2_pdu_is_compound(smb2);
+}
+
 /* Server thread. Never blocks: if the worker gate is full the op sits
  * on io_pending until io_kick() runs from extra_service. Counted from
  * accept until io_op_finish queues the reply. */
@@ -282,7 +310,44 @@ static void io_worker(void *ctx)
         struct inas_state *fs = &g;
         struct inas_io_completion *op = ctx;
 
-        if (op->is_read) {
+        if (op->kind == IO_SETINFO) {
+                struct inas_handle tmp;
+                struct smb2_file_basic_info bi;
+                struct smb2_iovec v;
+                uint64_t w;
+
+                memset(&tmp, 0, sizeof(tmp));
+                tmp.fd = op->fd;
+                tmp.dirfd = op->rootfd;
+                if (op->cr_name) {
+                        snprintf(tmp.leaf, sizeof(tmp.leaf), "%s", op->cr_name);
+                }
+                memset(&bi, 0, sizeof(bi));
+                v.buf = op->buf;
+                v.len = op->length;
+                v.free = NULL;
+                if (op->buf && op->length >= 40) {
+                        smb2_get_uint64(&v, 0, &w);
+                        if (w && w != ~(uint64_t)0) {
+                                smb2_win_to_timeval(w, &bi.creation_time);
+                        }
+                        smb2_get_uint64(&v, 8, &w);
+                        if (w && w != ~(uint64_t)0) {
+                                smb2_win_to_timeval(w, &bi.last_access_time);
+                        }
+                        smb2_get_uint64(&v, 16, &w);
+                        if (w && w != ~(uint64_t)0) {
+                                smb2_win_to_timeval(w, &bi.last_write_time);
+                        }
+                        smb2_get_uint64(&v, 24, &w);
+                        if (w && w != ~(uint64_t)0) {
+                                smb2_win_to_timeval(w, &bi.change_time);
+                        }
+                        op->status = apply_basic_times(&tmp, &bi);
+                } else {
+                        op->status = 0;
+                }
+        } else if (op->is_read) {
                 op->buf = malloc(op->length ? op->length : 1);
                 if (!op->buf) {
                         op->status = -ENOMEM;
@@ -292,11 +357,13 @@ static void io_worker(void *ctx)
         } else {
                 op->status = (int)pwrite(op->fd, op->buf, op->length, (off_t)op->offset);
         }
-        if (op->status < 0) {
+        if (op->kind != IO_SETINFO && op->status < 0) {
                 op->status = -errno;
         }
-        close(op->fd);
-        op->fd = -1;
+        if (op->fd >= 0) {
+                close(op->fd);
+                op->fd = -1;
+        }
 
         pthread_mutex_lock(&fs->io_lock);
         op->next = NULL;
@@ -311,6 +378,26 @@ static void io_worker(void *ctx)
         uint8_t wake = 1;
         (void)write(fs->wake[1], &wake, sizeof(wake));
         dispatch_semaphore_signal(fs->io_worker_gate);
+}
+
+static void fill_create_reply(struct smb2_create_reply *rep, struct inas_handle *h,
+                              const struct stat *st)
+{
+        memcpy(rep->file_id, h->id, SMB2_FD_SIZE);
+        rep->file_attributes = stat_to_attrs(st);
+        if (S_ISDIR(st->st_mode)) {
+                rep->end_of_file = 0;
+                rep->allocation_size = 0;
+        } else {
+                rep->end_of_file = (uint64_t)st->st_size;
+                rep->allocation_size = (uint64_t)st->st_blocks * 512ull;
+        }
+        rep->creation_time = timespec_to_smb(&st->st_birthtimespec);
+        rep->last_access_time = timespec_to_smb(&st->st_atimespec);
+        rep->last_write_time = timespec_to_smb(&st->st_mtimespec);
+        rep->change_time = timespec_to_smb(&st->st_ctimespec);
+        rep->create_action = h->create_action ? h->create_action : 1;
+        rep->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
 }
 
 /* Server-thread only: queue the reply for one completed op. */
@@ -348,8 +435,21 @@ static void io_op_finish(struct inas_state *fs, struct inas_io_completion *op)
         struct smb2_context *smb2 = op->target->smb2;
         struct smb2_pdu *pdu = NULL;
         char line[96];
+
         if (!op->target->dead) {
-                if (op->is_read) {
+                if (op->kind == IO_SETINFO) {
+                        if (op->status == 0) {
+                                struct smb2_set_info_request dummy;
+                                memset(&dummy, 0, sizeof(dummy));
+                                pdu = smb2_cmd_set_info_reply_async(smb2, &dummy, NULL, NULL);
+                        } else {
+                                struct smb2_error_reply err;
+                                memset(&err, 0, sizeof(err));
+                                pdu = smb2_cmd_error_reply_async(
+                                    smb2, &err, SMB2_SET_INFO, inas_status_from_errno(-op->status),
+                                    NULL, NULL);
+                        }
+                } else if (op->is_read) {
                         struct smb2_read_reply rep;
                         memset(&rep, 0, sizeof(rep));
                         if (op->status >= 0) {
@@ -416,6 +516,12 @@ static void io_op_finish(struct inas_state *fs, struct inas_io_completion *op)
                         fprintf(stderr, "inas-smb: %s\n", line);
                 }
         }
+        if (op->rootfd >= 0) {
+                close(op->rootfd);
+                op->rootfd = -1;
+        }
+        free(op->cr_name);
+        op->cr_name = NULL;
         io_target_release(fs, op->target);
         free(op->buf);
         free(op);
@@ -453,6 +559,10 @@ static void io_teardown(struct inas_state *fs)
         pthread_mutex_unlock(&fs->io_lock);
         while (op) {
                 struct inas_io_completion *next = op->next;
+                if (op->rootfd >= 0) {
+                        close(op->rootfd);
+                }
+                free(op->cr_name);
                 io_target_release(fs, op->target);
                 free(op->buf);
                 free(op);
@@ -464,6 +574,10 @@ static void io_teardown(struct inas_state *fs)
                 if (pending->fd >= 0) {
                         close(pending->fd);
                 }
+                if (pending->rootfd >= 0) {
+                        close(pending->rootfd);
+                }
+                free(pending->cr_name);
                 io_target_release(fs, pending->target);
                 free(pending->buf);
                 free(pending);
@@ -705,6 +819,58 @@ static uint32_t stat_to_attrs(const struct stat *st)
                 return SMB2_FILE_ATTRIBUTE_DIRECTORY;
         }
         return SMB2_FILE_ATTRIBUTE_NORMAL;
+}
+
+static int timeval_omit(const struct smb2_timeval *tv)
+{
+        return tv->tv_sec == 0 && tv->tv_usec == 0;
+}
+
+static void timeval_to_timespec(const struct smb2_timeval *tv, struct timespec *ts)
+{
+        ts->tv_sec = tv->tv_sec;
+        ts->tv_nsec = tv->tv_usec * 1000L;
+}
+
+static int apply_basic_times(struct inas_handle *h, struct smb2_file_basic_info *b)
+{
+        struct timespec times[2];
+        int set_at = !timeval_omit(&b->last_access_time);
+        int set_mt = !timeval_omit(&b->last_write_time);
+
+        times[0].tv_sec = 0;
+        times[0].tv_nsec = UTIME_OMIT;
+        times[1].tv_sec = 0;
+        times[1].tv_nsec = UTIME_OMIT;
+        if (set_at) {
+                timeval_to_timespec(&b->last_access_time, &times[0]);
+        }
+        if (set_mt) {
+                timeval_to_timespec(&b->last_write_time, &times[1]);
+        }
+        if (set_at || set_mt) {
+                if (h->fd >= 0) {
+                        if (futimens(h->fd, times) != 0) {
+                                return -errno;
+                        }
+                } else if (h->dirfd >= 0 && h->leaf[0]) {
+                        if (utimensat(h->dirfd, h->leaf, times, AT_SYMLINK_NOFOLLOW) != 0) {
+                                return -errno;
+                        }
+                }
+        }
+#ifdef __APPLE__
+        if (!timeval_omit(&b->creation_time) && h->fd >= 0) {
+                struct attrlist al;
+                struct timespec cr;
+                memset(&al, 0, sizeof(al));
+                al.bitmapcount = ATTR_BIT_MAP_COUNT;
+                al.commonattr = ATTR_CMN_CRTIME;
+                timeval_to_timespec(&b->creation_time, &cr);
+                (void)fsetattrlist(h->fd, &al, &cr, sizeof(cr), 0);
+        }
+#endif
+        return 0;
 }
 
 static const char *share_root_for_tree(struct inas_state *fs, struct smb2_context *smb2)
@@ -995,7 +1161,7 @@ static int tree_connect_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 return -ENOENT;
         }
         rep->share_type = SMB2_SHARE_TYPE_DISK;
-        rep->share_flags = SMB2_SHAREFLAG_NO_CACHING | SMB2_SHAREFLAG_ENCRYPT_DATA;
+        rep->share_flags = SMB2_SHAREFLAG_ENCRYPT_DATA;
         rep->capabilities = 0;
         rep->maximal_access = 0x001f01ff;
         rep->tree_id = (uint32_t)(index + 1);
@@ -1231,21 +1397,7 @@ static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 pthread_mutex_unlock(&fs->lock);
                 return err;
         }
-        memcpy(rep->file_id, h->id, SMB2_FD_SIZE);
-        rep->file_attributes = stat_to_attrs(&st);
-        if (S_ISDIR(st.st_mode)) {
-                rep->end_of_file = 0;
-                rep->allocation_size = 0;
-        } else {
-                rep->end_of_file = (uint64_t)st.st_size;
-                rep->allocation_size = (uint64_t)st.st_blocks * 512ull;
-        }
-        rep->creation_time = timespec_to_smb(&st.st_birthtimespec);
-        rep->last_access_time = timespec_to_smb(&st.st_atimespec);
-        rep->last_write_time = timespec_to_smb(&st.st_mtimespec);
-        rep->change_time = timespec_to_smb(&st.st_ctimespec);
-        rep->create_action = h->create_action ? h->create_action : 1;
-        rep->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
+        fill_create_reply(rep, h, &st);
         if (h->create_action == 2) {
                 notify_mark(fs);
         }
@@ -1354,12 +1506,14 @@ static int read_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 rep->data_remaining = 0;
                 return 0;
         }
-        if (fs->io_worker_queue != NULL) {
+        if (io_can_defer(fs, smb2)) {
                 /* Hand the blocking pread to the worker pool. The reply is
                  * queued from extra_service() on the server thread once the
                  * completion drains. */
                 struct inas_io_completion *op = calloc(1, sizeof(*op));
                 if (op) {
+                        op->fd = -1; /* calloc zero is a valid fd; -1 = unset */
+                        op->rootfd = -1;
                         op->target = io_target_for(fs, smb2);
                         op->message_id = smb2_get_last_request_message_id(smb2);
                         op->is_read = 1;
@@ -1436,10 +1590,12 @@ static int write_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 pthread_mutex_unlock(&fs->lock);
                 return -EINVAL;
         }
-        if (req->length > 0 && fs->io_worker_queue != NULL) {
+        if (req->length > 0 && io_can_defer(fs, smb2)) {
                 /* Hand the blocking pwrite to the worker pool (see read_cmd). */
                 struct inas_io_completion *op = calloc(1, sizeof(*op));
                 if (op) {
+                        op->fd = -1; /* calloc zero is a valid fd; -1 = unset */
+                        op->rootfd = -1;
                         op->buf = malloc(req->length);
                         op->target = io_target_for(fs, smb2);
                         op->message_id = smb2_get_last_request_message_id(smb2);
@@ -2129,7 +2285,76 @@ static int set_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         notify_mark(fs);
                         break;
                 }
-                case SMB2_FILE_BASIC_INFORMATION:
+                case SMB2_FILE_BASIC_INFORMATION: {
+                        /* Server decode leaves the 40-byte MS-FSCC blob, not
+                         * struct smb2_file_basic_info (smb2_timeval). */
+                        struct smb2_file_basic_info bi;
+                        struct smb2_iovec v;
+                        uint64_t w;
+                        memset(&bi, 0, sizeof(bi));
+                        if (req->input_data && req->buffer_length >= 40 && io_can_defer(fs, smb2)) {
+                                struct inas_io_completion *op = calloc(1, sizeof(*op));
+                                if (op) {
+                                        op->fd = -1; /* calloc zero is a valid fd; -1 = unset */
+                                        op->rootfd = -1;
+                                        op->kind = IO_SETINFO;
+                                        op->target = io_target_for(fs, smb2);
+                                        op->message_id = smb2_get_last_request_message_id(smb2);
+                                        op->buf = malloc(req->buffer_length);
+                                        op->length = req->buffer_length;
+                                        op->fd = h->fd >= 0 ? dup(h->fd) : -1;
+                                        op->rootfd = h->dirfd >= 0 ? dup(h->dirfd) : -1;
+                                        if (h->leaf[0]) {
+                                                op->cr_name = strdup(h->leaf);
+                                        }
+                                        if (op->buf) {
+                                                memcpy(op->buf, req->input_data,
+                                                       req->buffer_length);
+                                        }
+                                }
+                                if (op && op->target && op->buf &&
+                                    (op->fd >= 0 || (op->rootfd >= 0 && op->cr_name))) {
+                                        pthread_mutex_unlock(&fs->lock);
+                                        io_op_dispatch(fs, op);
+                                        return 1;
+                                }
+                                if (op) {
+                                        io_target_release(fs, op->target);
+                                        if (op->fd >= 0) {
+                                                close(op->fd);
+                                        }
+                                        if (op->rootfd >= 0) {
+                                                close(op->rootfd);
+                                        }
+                                        free(op->buf);
+                                        free(op->cr_name);
+                                        free(op);
+                                }
+                        }
+                        if (req->input_data && req->buffer_length >= 40) {
+                                v.buf = req->input_data;
+                                v.len = req->buffer_length;
+                                v.free = NULL;
+                                smb2_get_uint64(&v, 0, &w);
+                                if (w && w != ~(uint64_t)0) {
+                                        smb2_win_to_timeval(w, &bi.creation_time);
+                                }
+                                smb2_get_uint64(&v, 8, &w);
+                                if (w && w != ~(uint64_t)0) {
+                                        smb2_win_to_timeval(w, &bi.last_access_time);
+                                }
+                                smb2_get_uint64(&v, 16, &w);
+                                if (w && w != ~(uint64_t)0) {
+                                        smb2_win_to_timeval(w, &bi.last_write_time);
+                                }
+                                smb2_get_uint64(&v, 24, &w);
+                                if (w && w != ~(uint64_t)0) {
+                                        smb2_win_to_timeval(w, &bi.change_time);
+                                }
+                                rc = apply_basic_times(h, &bi);
+                        }
+                        break;
+                }
                 case SMB2_FILE_ALLOCATION_INFORMATION:
                 case SMB2_FILE_POSITION_INFORMATION:
                 case SMB2_FILE_MODE_INFORMATION:
