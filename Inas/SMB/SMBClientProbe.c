@@ -1467,13 +1467,14 @@ int inas_smb_client_change_notify_mutate(const char *host, uint16_t port, const 
                 smb2_close(smb2, fh);
                 goto out;
         }
-        smb2_close(smb2, fh);
-
+        /* Leave the handle open: CLOSE after WRITE now marks notify dirty. */
         if (wait_for_cb_timeout(smb2, &rs, 400) == 0) {
                 snprintf(err, (size_t)errlen, "CHANGE_NOTIFY completed on WRITE status 0x%x",
                          (unsigned)rs.status);
+                smb2_close(smb2, fh);
                 goto out;
         }
+        smb2_close(smb2, fh);
 
         fh = smb2_open(smb2, "cn-new.txt", O_RDWR | O_CREAT);
         if (!fh) {
@@ -1935,6 +1936,70 @@ out:
                 smb2_disconnect_share(smb2);
                 smb2_destroy_context(smb2);
         }
+        return rc;
+}
+
+int inas_smb_client_flush_is_fast(const char *host, uint16_t port, const char *user,
+                                  const char *password, const char *share, char *err, int errlen)
+{
+        struct smb2_context *smb2;
+        struct smb2fh *fh;
+        uint8_t *buf;
+        struct smb2_flush_request fl;
+        struct raw_status rs;
+        struct timespec t0, t1;
+        long ms;
+        const uint32_t chunk = 1024 * 1024;
+        int rc = -1;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+        buf = malloc(chunk);
+        if (!buf) {
+                set_err(err, errlen, NULL, "malloc failed");
+                goto out;
+        }
+        memset(buf, 0x5a, chunk);
+        fh = smb2_open(smb2, "flush-fast.bin", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create flush-fast.bin failed");
+                goto out;
+        }
+        if (smb2_pwrite(smb2, fh, buf, chunk, 0) != (int)chunk) {
+                set_err(err, errlen, smb2, "write flush-fast.bin failed");
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        memset(&fl, 0, sizeof(fl));
+        memcpy(fl.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (run_until_status(smb2, smb2_cmd_flush_async(smb2, &fl, raw_cb, &rs), &rs, "FLUSH", err,
+                             errlen) != 0) {
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        smb2_close(smb2, fh);
+        if (rs.status != 0) {
+                snprintf(err, (size_t)errlen, "FLUSH status 0x%x", (unsigned)rs.status);
+                goto out;
+        }
+        ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        if (ms > 1000) {
+                snprintf(err, (size_t)errlen, "FLUSH took %ld ms", ms);
+                goto out;
+        }
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        if (smb2) {
+                smb2_unlink(smb2, "flush-fast.bin");
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        free(buf);
         return rc;
 }
 

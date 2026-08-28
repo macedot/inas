@@ -111,6 +111,10 @@ int inas_smb_client_parallel_create_delete_list(const char *host, uint16_t port,
                                                 const char *password, const char *share, char *err,
                                                 int errlen);
 
+/* CREATE + 1MB WRITE + FLUSH + CLOSE must finish quickly (no fsync stall). */
+int inas_smb_client_flush_is_fast(const char *host, uint16_t port, const char *user,
+                                  const char *password, const char *share, char *err, int errlen);
+
 #endif /* DEBUG */
 
 #ifdef __cplusplus

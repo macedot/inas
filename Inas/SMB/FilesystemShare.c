@@ -101,10 +101,12 @@ struct inas_handle {
         int unlinked; /* name already removed (SET_INFO disposition) */
         int notify_pending;
         uint64_t notify_mid;
+        struct timespec notify_armed_at;
         uint32_t enum_index;
         int enum_done;
         uint32_t access;
         int is_pipe;
+        int wrote;
         uint32_t create_action;
         uint8_t *rpc_out;
         size_t rpc_out_len;
@@ -147,6 +149,7 @@ struct inas_state {
         dispatch_semaphore_t io_worker_gate;
         struct smb2_context *sessions[INAS_MAX_SESSIONS];
         int notify_dirty;
+        struct timespec notify_dirty_at;
         struct smb2_server server;
         inas_auth_slot auth[INAS_AUTH_PEERS];
         inas_auth_global auth_global;
@@ -512,11 +515,23 @@ static void notify_send(struct smb2_context *smb2, uint64_t message_id, uint32_t
 /* Complete every outstanding CHANGE_NOTIFY. Finder watches displayed
  * folders; STATUS_NOTIFY_ENUM_DIR tells it to re-list. Flushed once per
  * extra_service tick so a batch CREATE does not re-list after every file. */
+static int timespec_leq(const struct timespec *a, const struct timespec *b)
+{
+        if (a->tv_sec != b->tv_sec) {
+                return a->tv_sec < b->tv_sec;
+        }
+        return a->tv_nsec <= b->tv_nsec;
+}
+
 static void notify_complete_all(struct inas_state *fs, uint32_t status)
 {
         for (int i = 0; i < INAS_MAX_HANDLES; i++) {
                 struct inas_handle *h = &fs->handles[i];
                 if (!h->in_use || !h->notify_pending) {
+                        continue;
+                }
+                /* A watch armed after the mutation must not consume it. */
+                if (!timespec_leq(&h->notify_armed_at, &fs->notify_dirty_at)) {
                         continue;
                 }
                 notify_send(h->owner, h->notify_mid, status);
@@ -528,11 +543,31 @@ static void notify_complete_all(struct inas_state *fs, uint32_t status)
 static void notify_mark(struct inas_state *fs)
 {
         fs->notify_dirty = 1;
+        clock_gettime(CLOCK_MONOTONIC, &fs->notify_dirty_at);
+}
+
+static int io_is_idle(struct inas_state *fs)
+{
+        if (atomic_load(&fs->active_transfers) != 0) {
+                return 0;
+        }
+        pthread_mutex_lock(&fs->io_lock);
+        int idle = fs->io_pending_head == NULL && fs->io_done_head == NULL;
+        pthread_mutex_unlock(&fs->io_lock);
+        return idle;
 }
 
 static void notify_flush(struct inas_state *fs)
 {
-        if (!fs->notify_dirty) {
+        struct timespec now;
+
+        if (!fs->notify_dirty || !io_is_idle(fs)) {
+                return;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((now.tv_sec - fs->notify_dirty_at.tv_sec) * 1000 +
+                (now.tv_nsec - fs->notify_dirty_at.tv_nsec) / 1000000 <
+            100) {
                 return;
         }
         fs->notify_dirty = 0;
@@ -1236,6 +1271,9 @@ static int close_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         memset(rep, 0, sizeof(*rep));
         rep->file_attributes = stat_to_attrs(&st);
         rep->end_of_file = (uint64_t)st.st_size;
+        if (h->wrote) {
+                notify_mark(fs);
+        }
         int rc = handle_free(fs, h, 1);
         pthread_mutex_unlock(&fs->lock);
         return rc;
@@ -1252,9 +1290,9 @@ static int flush_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 pthread_mutex_unlock(&fs->lock);
                 return -EBADF;
         }
-        if (h->fd >= 0) {
-                fsync(h->fd);
-        }
+        /* Samba strict sync = no: do not fsync on SMB2 FLUSH. fsync of a
+         * large file blocks the server thread and Finder copy hangs at 100%. */
+        (void)h;
         pthread_mutex_unlock(&fs->lock);
         return 0;
 }
@@ -1411,12 +1449,14 @@ static int write_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                                 free(op);
                         } else {
                                 memcpy(op->buf, req->buf, req->length);
+                                h->wrote = 1;
                                 pthread_mutex_unlock(&fs->lock);
                                 io_op_dispatch(fs, op);
                                 return 1; /* deferred; reply queued later */
                         }
                 }
         }
+        h->wrote = 1;
         atomic_fetch_add(&fs->active_transfers, 1);
         ssize_t n = pwrite(h->fd, req->buf, req->length, (off_t)req->offset);
         pthread_mutex_unlock(&fs->lock);
@@ -2185,6 +2225,7 @@ static int change_notify_cmd(struct smb2_server *srvr, struct smb2_context *smb2
         mid = smb2_get_last_request_message_id(smb2);
         h->notify_pending = 1;
         h->notify_mid = mid;
+        clock_gettime(CLOCK_MONOTONIC, &h->notify_armed_at);
         pthread_mutex_unlock(&fs->lock);
         /* No PDU now — same deferred pattern as READ/WRITE. Finder's
          * poll fallback was the multi-second spinner; we complete this
