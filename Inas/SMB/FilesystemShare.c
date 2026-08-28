@@ -189,7 +189,7 @@ static void ioperf(struct smb2_context *smb2, const char *op, const char *phase,
         struct timeval tv;
         char path[512];
         FILE *f;
-        const char *tmp = getenv("TMPDIR");
+        const char *home = getenv("HOME");
         unsigned gr = 0, ch = 0;
 
         if (smb2) {
@@ -197,7 +197,9 @@ static void ioperf(struct smb2_context *smb2, const char *op, const char *phase,
                 ch = smb2->hdr.credit_charge;
         }
         gettimeofday(&tv, NULL);
-        snprintf(path, sizeof(path), "%s/ioperf-debug.log", tmp ? tmp : "/tmp");
+        snprintf(path, sizeof(path), "%s/Library/Caches", home ? home : "/tmp");
+        mkdir(path, 0755); /* fresh containers may not have Caches yet */
+        snprintf(path, sizeof(path), "%s/Documents/ioperf-debug.log", home ? home : "/tmp");
         f = fopen(path, "a");
         if (!f) {
                 return;
@@ -1263,7 +1265,14 @@ static int open_path(struct inas_handle *h, int rootfd, const char *smb_name,
                         return -errno;
                 }
                 h->is_dir = 1;
-                h->fd = dup(h->dirfd);
+                /* Fresh open, NOT dup(): dirfd is the long-lived share
+                 * root and its file offset persists across handles. A
+                 * dup'd handle would inherit a consumed offset and
+                 * enumerate nothing (smbclient sends no RESTART_SCANS). */
+                h->fd = openat(h->dirfd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                if (h->fd < 0) {
+                        return -errno;
+                }
                 if (h->fd < 0) {
                         return -errno;
                 }
@@ -2107,10 +2116,13 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 }
         }
         if (!h->dir) {
-                int dfd = h->fd >= 0 ? dup(h->fd) : dup(h->dirfd);
+                /* Fresh open (independent offset) rather than dup: see the
+                 * root-handle note in open_path. */
+                int dfd = openat(h->dirfd, h->leaf[0] ? h->leaf : ".",
+                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
                 if (dfd < 0) {
                         pthread_mutex_unlock(&fs->lock);
-                        return -1;
+                        return -errno;
                 }
                 h->dir = fdopendir(dfd);
                 if (!h->dir) {
@@ -2121,6 +2133,24 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
         }
 
         const char *pattern = req->name ? req->name : "*";
+#ifdef INAS_DEFER_DEBUG
+        {
+                char path[512];
+                FILE *df;
+                const char *tmp = getenv("HOME");
+                snprintf(path, sizeof(path), "%s/Documents/ioperf-debug.log", tmp ? tmp : "/tmp");
+                df = fopen(path, "a");
+                if (df) {
+                        fprintf(df,
+                                "QDIR id=%02x%02x%02x%02x flags=%u class=%u pat=[%s] "
+                                "done=%d idx=%u\n",
+                                req->file_id[0], req->file_id[1], req->file_id[2], req->file_id[3],
+                                req->flags, req->file_information_class, pattern, h->enum_done,
+                                h->enum_index);
+                        fclose(df);
+                }
+        }
+#endif
         /* Clients send rooted patterns ("\*", "sub\*") while the search is
          * relative to the handle's directory - smbclient's "ls" sends "\*"
          * and would match nothing. Use the basename. */
@@ -2212,12 +2242,42 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
         }
         h->enum_index += (uint32_t)count;
         if (count == 0) {
+                /* Spec-mandated empty-result statuses: clients (smbclient)
+                 * treat SUCCESS-with-no-entries as an abnormal result.
+                 * Continuation past the end -> NO_MORE_FILES; a first
+                 * query that matched nothing -> NO_SUCH_FILE. */
+                struct smb2_error_reply err;
+                struct smb2_pdu *epdu;
+                uint32_t status =
+                    h->enum_index > 0 ? SMB2_STATUS_NO_MORE_FILES : SMB2_STATUS_NO_SUCH_FILE;
+
                 h->enum_done = 1;
                 pthread_mutex_unlock(&fs->lock);
+                memset(&err, 0, sizeof(err));
+                epdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_QUERY_DIRECTORY, status, NULL,
+                                                  NULL);
+                if (epdu != NULL) {
+                        smb2_set_pdu_message_id(smb2, epdu, smb2_get_last_request_message_id(smb2));
+                        smb2_queue_pdu(smb2, epdu);
+                        return 1;
+                }
                 rep->output_buffer = NULL;
                 rep->output_buffer_length = 0;
                 return 0;
         }
+#ifdef INAS_DEFER_DEBUG
+        {
+                char path[512];
+                FILE *df;
+                const char *tmp = getenv("HOME");
+                snprintf(path, sizeof(path), "%s/Documents/ioperf-debug.log", tmp ? tmp : "/tmp");
+                df = fopen(path, "a");
+                if (df) {
+                        fprintf(df, "QDIR => %zu entries\n", count);
+                        fclose(df);
+                }
+        }
+#endif
 
         size_t recsz = PAD_TO_64BIT(sizeof(struct smb2_fileidbothdirectoryinformation));
         size_t packed = recsz * count;
