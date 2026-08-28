@@ -320,6 +320,26 @@ final class SMBLoopbackTests: XCTestCase {
         )
     }
 
+    func testClientCountSurvivesFailedLogin() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            inas_smb_client_count_survives_failed_login("127.0.0.1", port, "inas", "correct1", "inas", &err, Int32(err.count)),
+            0,
+            String(cString: err)
+        )
+    }
+
+    func testConcurrentCopyAndShareEnum() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            inas_smb_client_concurrent_copy_and_enum("127.0.0.1", port, "inas", "correct1", "inas", &err, Int32(err.count)),
+            0,
+            String(cString: err)
+        )
+    }
+
     private func openFDCount() -> Int? {
         try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
     }

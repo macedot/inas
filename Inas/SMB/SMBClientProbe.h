@@ -92,6 +92,16 @@ int inas_smb_client_change_notify_mutate(const char *host, uint16_t port, const 
                                          const char *password, const char *share, char *err,
                                          int errlen);
 
+/* Live session must stay counted when another TCP dies before login. */
+int inas_smb_client_count_survives_failed_login(const char *host, uint16_t port, const char *user,
+                                                const char *password, const char *share, char *err,
+                                                int errlen);
+
+/* WRITE on one connection while share-enum + QUERY_DIRECTORY run on others. */
+int inas_smb_client_concurrent_copy_and_enum(const char *host, uint16_t port, const char *user,
+                                             const char *password, const char *share, char *err,
+                                             int errlen);
+
 #endif /* DEBUG */
 
 #ifdef __cplusplus

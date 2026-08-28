@@ -6,6 +6,7 @@
  * of the app carry no SMB client code. */
 
 #include "SMBClientProbe.h"
+#include "FilesystemShare.h"
 #include "Srvsvc.h"
 
 #include <sys/types.h>
@@ -18,10 +19,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #if DEBUG
 
@@ -1501,6 +1504,180 @@ out:
                 smb2_disconnect_share(smb2);
                 smb2_destroy_context(smb2);
         }
+        return rc;
+}
+
+int inas_smb_client_count_survives_failed_login(const char *host, uint16_t port, const char *user,
+                                                const char *password, const char *share, char *err,
+                                                int errlen)
+{
+        struct smb2_context *live;
+        uint16_t negotiated = 0;
+        char failerr[128];
+        int i;
+        int n;
+        int rc = -1;
+
+        live = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!live) {
+                return -1;
+        }
+        for (i = 0; i < 50 && inas_smb_client_count() < 1; i++) {
+                usleep(20000);
+        }
+        if (inas_smb_client_count() < 1) {
+                set_err(err, errlen, NULL, "live session never counted");
+                goto out;
+        }
+        if (inas_smb_client_connect(host, port, user, "wrong-password", share, 0, &negotiated,
+                                    failerr, (int)sizeof(failerr)) == 0) {
+                set_err(err, errlen, NULL, "wrong password succeeded");
+                goto out;
+        }
+        for (i = 0; i < 25; i++) {
+                usleep(20000);
+        }
+        n = inas_smb_client_count();
+        if (n != 1) {
+                snprintf(err, (size_t)errlen, "count after failed login is %d, want 1", n);
+                goto out;
+        }
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        smb2_disconnect_share(live);
+        smb2_destroy_context(live);
+        return rc;
+}
+
+struct conc_copy {
+        const char *host;
+        uint16_t port;
+        const char *user;
+        const char *password;
+        const char *share;
+        volatile int writing;
+        volatile int write_rc;
+        char werr[256];
+};
+
+static void *conc_copy_thread(void *arg)
+{
+        struct conc_copy *a = arg;
+        struct smb2_context *smb2;
+        struct smb2fh *fh;
+        uint8_t *buf;
+        int i;
+
+        a->write_rc = -1;
+        smb2 = open_share(a->host, a->port, a->user, a->password, a->share, 0, a->werr,
+                          (int)sizeof(a->werr));
+        if (!smb2) {
+                a->writing = 0;
+                return NULL;
+        }
+        fh = smb2_open(smb2, "conc-copy.bin", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(a->werr, (int)sizeof(a->werr), smb2, "create conc-copy.bin failed");
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+                a->writing = 0;
+                return NULL;
+        }
+        buf = malloc(512 * 1024);
+        if (!buf) {
+                smb2_close(smb2, fh);
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+                a->writing = 0;
+                return NULL;
+        }
+        memset(buf, 0xab, 512 * 1024);
+        a->writing = 1;
+        for (i = 0; i < 16; i++) {
+                if (smb2_pwrite(smb2, fh, buf, 512 * 1024, (uint64_t)i * 512 * 1024) < 0) {
+                        set_err(a->werr, (int)sizeof(a->werr), smb2, "pwrite conc-copy.bin failed");
+                        a->writing = 0;
+                        free(buf);
+                        smb2_close(smb2, fh);
+                        smb2_unlink(smb2, "conc-copy.bin");
+                        smb2_disconnect_share(smb2);
+                        smb2_destroy_context(smb2);
+                        return NULL;
+                }
+        }
+        a->write_rc = 0;
+        a->writing = 0;
+        free(buf);
+        smb2_close(smb2, fh);
+        smb2_unlink(smb2, "conc-copy.bin");
+        smb2_disconnect_share(smb2);
+        smb2_destroy_context(smb2);
+        return NULL;
+}
+
+int inas_smb_client_concurrent_copy_and_enum(const char *host, uint16_t port, const char *user,
+                                             const char *password, const char *share, char *err,
+                                             int errlen)
+{
+        struct conc_copy a;
+        pthread_t th;
+        char e2[256];
+        int i;
+        int enum_ok = 0;
+        int qdir_ok = 0;
+        int saw_busy = 0;
+        int rc = -1;
+
+        memset(&a, 0, sizeof(a));
+        a.host = host;
+        a.port = port;
+        a.user = user;
+        a.password = password;
+        a.share = share;
+        if (pthread_create(&th, NULL, conc_copy_thread, &a) != 0) {
+                set_err(err, errlen, NULL, "pthread_create failed");
+                return -1;
+        }
+        for (i = 0; i < 100 && !a.writing && a.write_rc != 0; i++) {
+                usleep(20000);
+        }
+        if (a.writing) {
+                saw_busy = 1;
+        }
+        for (i = 0; i < 40; i++) {
+                if (inas_smb_client_share_enum(host, port, user, password, share, e2,
+                                               (int)sizeof(e2)) == 0) {
+                        enum_ok = 1;
+                }
+                if (inas_smb_client_query_dir_wire(host, port, user, password, share, e2,
+                                                   (int)sizeof(e2)) == 0) {
+                        qdir_ok = 1;
+                }
+                if (a.writing) {
+                        saw_busy = 1;
+                }
+                if (enum_ok && qdir_ok && (saw_busy || a.write_rc == 0)) {
+                        break;
+                }
+                usleep(50000);
+        }
+        pthread_join(th, NULL);
+        if (a.write_rc != 0) {
+                snprintf(err, (size_t)errlen, "copy thread failed: %s", a.werr);
+                goto out;
+        }
+        if (!enum_ok) {
+                snprintf(err, (size_t)errlen, "share enum failed during copy: %s", e2);
+                goto out;
+        }
+        if (!qdir_ok) {
+                snprintf(err, (size_t)errlen, "QUERY_DIRECTORY failed during copy: %s", e2);
+                goto out;
+        }
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
         return rc;
 }
 

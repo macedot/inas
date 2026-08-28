@@ -1,0 +1,18 @@
+diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Vendor/libsmb2/lib/libsmb2.c
+index 7cea093..10626d6 100644
+--- a/Vendor/libsmb2/lib/libsmb2.c
++++ b/Vendor/libsmb2/lib/libsmb2.c
+@@ -4905,6 +4905,13 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
+                                                 smb2_close_context(smb2);
+                                         }
+                                 }
++                                /* Drain deferred replies after each client so a
++                                 * busy copy connection cannot starve credits
++                                 * (or a second client) until the whole list is
++                                 * processed. extra_service is idempotent. */
++                                if (server->extra_service) {
++                                        server->extra_service(server, &rfds, &wfds);
++                                }
+                                 if (!SMB2_VALID_SOCKET(smb2->fd) && ((time(NULL) - now) > (smb2->timeout)))
+                                 {
+                                         smb2_set_error(smb2, "Timeout expired and no connection exists");

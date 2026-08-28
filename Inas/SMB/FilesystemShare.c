@@ -52,6 +52,7 @@
 #define PAD_TO_64BIT(len) (((len) + 0x07u) & 0xfffffff8u)
 #define INAS_IO_TARGETS 16
 #define INAS_IO_MAX_INFLIGHT 8
+#define INAS_MAX_SESSIONS 16
 
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
@@ -139,9 +140,12 @@ struct inas_state {
         pthread_mutex_t io_lock;
         struct inas_io_completion *io_done_head;
         struct inas_io_completion *io_done_tail;
+        struct inas_io_completion *io_pending_head;
+        struct inas_io_completion *io_pending_tail;
         struct inas_io_target io_targets[INAS_IO_TARGETS];
         dispatch_queue_t io_worker_queue;
         dispatch_semaphore_t io_worker_gate;
+        struct smb2_context *sessions[INAS_MAX_SESSIONS];
         struct smb2_server server;
         inas_auth_slot auth[INAS_AUTH_PEERS];
         inas_auth_global auth_global;
@@ -202,12 +206,68 @@ static void io_target_release(struct inas_state *fs, struct inas_io_target *t)
 }
 
 static void io_worker(void *ctx);
+static void io_kick(struct inas_state *fs);
 
-/* Handler thread (server thread). Takes ownership of op. */
+static void io_pending_enqueue(struct inas_state *fs, struct inas_io_completion *op)
+{
+        op->next = NULL;
+        pthread_mutex_lock(&fs->io_lock);
+        if (fs->io_pending_tail) {
+                fs->io_pending_tail->next = op;
+        } else {
+                fs->io_pending_head = op;
+        }
+        fs->io_pending_tail = op;
+        pthread_mutex_unlock(&fs->io_lock);
+}
+
+static struct inas_io_completion *io_pending_dequeue(struct inas_state *fs)
+{
+        pthread_mutex_lock(&fs->io_lock);
+        struct inas_io_completion *op = fs->io_pending_head;
+        if (op) {
+                fs->io_pending_head = op->next;
+                if (!fs->io_pending_head) {
+                        fs->io_pending_tail = NULL;
+                }
+                op->next = NULL;
+        }
+        pthread_mutex_unlock(&fs->io_lock);
+        return op;
+}
+
+/* Start one op on a worker. Caller already owns a gate slot. */
+static void io_op_start(struct inas_state *fs, struct inas_io_completion *op)
+{
+        atomic_fetch_add(&fs->active_transfers, 1);
+        dispatch_async_f(fs->io_worker_queue, op, io_worker);
+}
+
+/* Server thread. Never blocks: if the worker gate is full the op sits
+ * on io_pending until io_kick() runs from extra_service. */
 static void io_op_dispatch(struct inas_state *fs, struct inas_io_completion *op)
 {
-        dispatch_semaphore_wait(fs->io_worker_gate, DISPATCH_TIME_FOREVER);
-        dispatch_async_f(fs->io_worker_queue, op, io_worker);
+        if (dispatch_semaphore_wait(fs->io_worker_gate, DISPATCH_TIME_NOW) == 0) {
+                io_op_start(fs, op);
+                return;
+        }
+        io_pending_enqueue(fs, op);
+        io_kick(fs);
+}
+
+static void io_kick(struct inas_state *fs)
+{
+        for (;;) {
+                if (dispatch_semaphore_wait(fs->io_worker_gate, DISPATCH_TIME_NOW) != 0) {
+                        return;
+                }
+                struct inas_io_completion *op = io_pending_dequeue(fs);
+                if (!op) {
+                        dispatch_semaphore_signal(fs->io_worker_gate);
+                        return;
+                }
+                io_op_start(fs, op);
+        }
 }
 
 /* Worker thread. Never touches smb2 — the server thread owns its
@@ -375,6 +435,7 @@ static void io_drain(struct inas_state *fs)
                 }
                 io_op_finish(fs, op);
         }
+        io_kick(fs);
 }
 
 static void io_teardown(struct inas_state *fs)
@@ -382,6 +443,8 @@ static void io_teardown(struct inas_state *fs)
         pthread_mutex_lock(&fs->io_lock);
         struct inas_io_completion *op = fs->io_done_head;
         fs->io_done_head = fs->io_done_tail = NULL;
+        struct inas_io_completion *pending = fs->io_pending_head;
+        fs->io_pending_head = fs->io_pending_tail = NULL;
         pthread_mutex_unlock(&fs->io_lock);
         while (op) {
                 struct inas_io_completion *next = op->next;
@@ -389,6 +452,16 @@ static void io_teardown(struct inas_state *fs)
                 free(op->buf);
                 free(op);
                 op = next;
+        }
+        while (pending) {
+                struct inas_io_completion *next = pending->next;
+                if (pending->fd >= 0) {
+                        close(pending->fd);
+                }
+                io_target_release(fs, pending->target);
+                free(pending->buf);
+                free(pending);
+                pending = next;
         }
         for (int i = 0; i < INAS_IO_TARGETS; i++) {
                 memset(&fs->io_targets[i], 0, sizeof(fs->io_targets[i]));
@@ -748,20 +821,38 @@ static int authorize_user(struct smb2_server *srvr, struct smb2_context *smb2, c
         return 0;
 }
 
+static int session_slot(struct inas_state *fs, struct smb2_context *smb2)
+{
+        for (int i = 0; i < INAS_MAX_SESSIONS; i++) {
+                if (fs->sessions[i] == smb2) {
+                        return i;
+                }
+        }
+        return -1;
+}
+
 static int session_established(struct smb2_server *srvr, struct smb2_context *smb2)
 {
         struct inas_state *fs = fs_state(srvr);
-        int n = atomic_fetch_add(&fs->clients, 1) + 1;
         pthread_mutex_lock(&fs->lock);
         time_t now = time(NULL);
         inas_auth_on_success(inas_auth_lookup(fs->auth, INAS_AUTH_PEERS, peer_ipv4(smb2), now));
         inas_auth_global_record_success(&fs->auth_global);
-        pthread_mutex_unlock(&fs->lock);
-        uint64_t peak = atomic_load(&fs->peak_clients);
-        while ((uint64_t)n > peak &&
-               !atomic_compare_exchange_weak(&fs->peak_clients, &peak, (uint64_t)n)) {
-                /* peak refreshed by the CAS; loop until it exceeds or wins */
+        if (session_slot(fs, smb2) < 0) {
+                for (int i = 0; i < INAS_MAX_SESSIONS; i++) {
+                        if (fs->sessions[i] == NULL) {
+                                fs->sessions[i] = smb2;
+                                int n = atomic_fetch_add(&fs->clients, 1) + 1;
+                                uint64_t peak = atomic_load(&fs->peak_clients);
+                                while ((uint64_t)n > peak &&
+                                       !atomic_compare_exchange_weak(&fs->peak_clients, &peak,
+                                                                     (uint64_t)n)) {
+                                }
+                                break;
+                        }
+                }
         }
+        pthread_mutex_unlock(&fs->lock);
         return 0;
 }
 
@@ -780,11 +871,15 @@ static int auth_failed(struct smb2_server *srvr, struct smb2_context *smb2)
 static int destruction_event(struct smb2_server *srvr, struct smb2_context *smb2)
 {
         struct inas_state *fs = fs_state(srvr);
-        int n = atomic_fetch_sub(&fs->clients, 1);
-        if (n <= 1) {
-                atomic_store(&fs->clients, 0);
-        }
         pthread_mutex_lock(&fs->lock);
+        int slot = session_slot(fs, smb2);
+        if (slot >= 0) {
+                fs->sessions[slot] = NULL;
+                int n = atomic_fetch_sub(&fs->clients, 1);
+                if (n <= 1) {
+                        atomic_store(&fs->clients, 0);
+                }
+        }
         handle_free_owned(fs, smb2);
         /* In-flight deferred ops for this context are dropped at drain time
          * (the worker never dereferences smb2, and the drain runs on this
@@ -1073,9 +1168,11 @@ static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 pthread_mutex_unlock(&fs->lock);
                 return -ENOMEM;
         }
+        pthread_mutex_unlock(&fs->lock);
         struct stat st;
         memset(&st, 0, sizeof(st));
         int err = open_path(h, rootfd, open_name, req, &st);
+        pthread_mutex_lock(&fs->lock);
         if (err != 0) {
                 handle_free(fs, h, 0);
                 pthread_mutex_unlock(&fs->lock);
@@ -1219,7 +1316,6 @@ static int read_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                                 io_target_release(fs, op->target);
                                 free(op);
                         } else {
-                                atomic_fetch_add(&fs->active_transfers, 1);
                                 pthread_mutex_unlock(&fs->lock);
                                 io_op_dispatch(fs, op);
                                 return 1; /* deferred; reply queued later */
@@ -1302,7 +1398,6 @@ static int write_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                                 free(op);
                         } else {
                                 memcpy(op->buf, req->buf, req->length);
-                                atomic_fetch_add(&fs->active_transfers, 1);
                                 pthread_mutex_unlock(&fs->lock);
                                 io_op_dispatch(fs, op);
                                 return 1; /* deferred; reply queued later */
@@ -1406,6 +1501,11 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 }
         }
 
+        DIR *dir = h->dir;
+        int atfd = h->fd >= 0 ? h->fd : h->dirfd;
+        uint32_t enum_index = h->enum_index;
+        pthread_mutex_unlock(&fs->lock);
+
         const char *pattern = req->name ? req->name : "*";
         struct dirent *de;
         struct smb2_fileidbothdirectoryinformation *entries = NULL;
@@ -1415,12 +1515,12 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
         uint32_t padded_sum = 0;
 
         for (;;) {
-                long loc = telldir(h->dir);
+                long loc = telldir(dir);
                 uint32_t fname16;
                 uint32_t raw;
                 uint32_t total_if_last;
 
-                de = readdir(h->dir);
+                de = readdir(dir);
                 if (de == NULL) {
                         break;
                 }
@@ -1432,7 +1532,7 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 total_if_last = padded_sum + raw;
                 if (room && count > 0 && total_if_last > room) {
                         if (loc != -1) {
-                                seekdir(h->dir, loc);
+                                seekdir(dir, loc);
                         }
                         break;
                 }
@@ -1441,18 +1541,16 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                         void *nbuf = realloc(entries, cap * sizeof(*entries));
                         if (!nbuf) {
                                 free(entries);
-                                pthread_mutex_unlock(&fs->lock);
                                 return -1;
                         }
                         entries = nbuf;
                 }
                 struct stat st;
                 memset(&st, 0, sizeof(st));
-                int atfd = h->fd >= 0 ? h->fd : h->dirfd;
                 fstatat(atfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW);
                 struct smb2_fileidbothdirectoryinformation *e = &entries[count];
                 memset(e, 0, sizeof(*e));
-                e->file_index = h->enum_index + (uint32_t)count;
+                e->file_index = enum_index + (uint32_t)count;
                 stat_to_timeval(&st.st_birthtimespec, &e->creation_time);
                 stat_to_timeval(&st.st_atimespec, &e->last_access_time);
                 stat_to_timeval(&st.st_mtimespec, &e->last_write_time);
@@ -1473,7 +1571,6 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                                 free((void *)entries[i].name);
                         }
                         free(entries);
-                        pthread_mutex_unlock(&fs->lock);
                         return -1;
                 }
                 count++;
@@ -1482,10 +1579,18 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                         break;
                 }
         }
-        h->enum_index += (uint32_t)count;
+
+        pthread_mutex_lock(&fs->lock);
+        h = handle_lookup(fs, req->file_id);
+        if (h) {
+                h->enum_index = enum_index + (uint32_t)count;
+                if (count == 0) {
+                        h->enum_done = 1;
+                }
+        }
+        pthread_mutex_unlock(&fs->lock);
+
         if (count == 0) {
-                h->enum_done = 1;
-                pthread_mutex_unlock(&fs->lock);
                 rep->output_buffer = NULL;
                 rep->output_buffer_length = 0;
                 return 0;
@@ -1503,7 +1608,6 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                         free((void *)entries[i].name);
                 }
                 free(entries);
-                pthread_mutex_unlock(&fs->lock);
                 return -1;
         }
         char *nptr = (char *)(buf + packed);
@@ -1518,7 +1622,6 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 free((void *)entries[i].name);
         }
         free(entries);
-        pthread_mutex_unlock(&fs->lock);
         rep->output_buffer = buf;
         rep->output_buffer_length = (uint32_t)packed;
         return 0;
@@ -2003,18 +2106,41 @@ static int ioctl_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         switch (req->ctl_code) {
         case SMB2_FSCTL_PIPE_TRANSCEIVE: {
                 struct inas_handle *h;
-                int rc;
+                char namebuf[INAS_MAX_SHARES][64];
+                const char *names[INAS_MAX_SHARES + 1];
+                uint8_t *out = NULL;
+                size_t out_len = 0;
+                int n = 0;
+                int i;
+
                 pthread_mutex_lock(&fs->lock);
                 h = handle_lookup(fs, req->file_id);
                 if (!h || !h->is_pipe) {
                         pthread_mutex_unlock(&fs->lock);
                         return -EBADF;
                 }
-                rc = pipe_run_rpc(fs, h, req->input, req->input_count);
-                if (rc != 0) {
-                        pthread_mutex_unlock(&fs->lock);
-                        return rc;
+                for (i = 0; i < fs->share_count && n < INAS_MAX_SHARES; i++) {
+                        snprintf(namebuf[n], sizeof(namebuf[n]), "%s", fs->shares[i].name);
+                        names[n] = namebuf[n];
+                        n++;
                 }
+                pthread_mutex_unlock(&fs->lock);
+                names[n++] = "IPC$";
+                if (inas_srvsvc_process(req->input, req->input_count, names, n, &out, &out_len) !=
+                    0) {
+                        return -EINVAL;
+                }
+                pthread_mutex_lock(&fs->lock);
+                h = handle_lookup(fs, req->file_id);
+                if (!h || !h->is_pipe) {
+                        pthread_mutex_unlock(&fs->lock);
+                        free(out);
+                        return -EBADF;
+                }
+                free(h->rpc_out);
+                h->rpc_out = out;
+                h->rpc_out_len = out_len;
+                h->rpc_out_off = 0;
                 rep->output = h->rpc_out;
                 rep->output_count = (uint32_t)h->rpc_out_len;
                 pthread_mutex_unlock(&fs->lock);
@@ -2159,15 +2285,16 @@ static void extra_fdset(struct smb2_server *server, fd_set *rfds, fd_set *wfds, 
 static void extra_service(struct smb2_server *server, fd_set *rfds, fd_set *wfds)
 {
         struct inas_state *fs = fs_state(server);
+        (void)rfds;
         (void)wfds;
         if (!fs->running && server->fd >= 0) {
                 close(server->fd);
                 server->fd = -1;
         }
-        if (fs->wake[0] >= 0 && FD_ISSET(fs->wake[0], rfds)) {
-                /* Wake-ups from the deferred-I/O workers: drain all
-                 * completed ops and queue their replies on this (server)
-                 * thread. */
+        /* Always drain completions. Handlers may finish workers after
+         * select() sampled rfds, and a full non-blocking wake pipe must
+         * not strand replies. */
+        if (fs->wake[0] >= 0) {
                 uint8_t scratch[64];
                 ssize_t n;
                 do {
@@ -2276,6 +2403,7 @@ int inas_smb_start(const inas_smb_config *config)
         atomic_store(&g.bytes_written, 0);
         atomic_store(&g.peak_clients, 0);
         atomic_store(&g.active_transfers, 0);
+        memset(g.sessions, 0, sizeof(g.sessions));
         memset(g.auth, 0, sizeof(g.auth));
         memset(&g.auth_global, 0, sizeof(g.auth_global));
         for (int i = 0; i < INAS_MAX_SHARES; i++) {
