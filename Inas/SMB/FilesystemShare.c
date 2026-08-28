@@ -168,6 +168,47 @@ struct inas_state {
 
 static struct inas_state g;
 
+#ifdef INAS_DEFER_DEBUG
+/* Per-op timeline: "<unix_us> <OP> <phase> mid=<n>" in the app sandbox
+ * tmp dir (NOT the share root: a growing file on the mounted share gets
+ * re-read by the Mac's Spotlight/FSEvents, which stamps more reads -
+ * a self-feeding loop). Fetch with:
+ *   xcrun devicectl device copy from --device <udid> \
+ *     --domain-type appDataDomain --domain-identifier app.inas.Inas \
+ *     --source tmp/ioperf-debug.log --destination <local> */
+#include <sys/time.h>
+static void ioperf(struct smb2_context *smb2, const char *op, const char *phase, uint64_t mid)
+{
+        struct timeval tv;
+        char path[512];
+        FILE *f;
+        const char *tmp = getenv("TMPDIR");
+        unsigned gr = 0, ch = 0;
+
+        if (smb2) {
+                gr = smb2->hdr.credit_request_response;
+                ch = smb2->hdr.credit_charge;
+        }
+        gettimeofday(&tv, NULL);
+        snprintf(path, sizeof(path), "%s/ioperf-debug.log", tmp ? tmp : "/tmp");
+        f = fopen(path, "a");
+        if (!f) {
+                return;
+        }
+        fprintf(f, "%lld.%06ld %s %s mid=%llu g=%u c=%u\n", (long long)tv.tv_sec, (long)tv.tv_usec,
+                op, phase, (unsigned long long)mid, gr, ch);
+        fclose(f);
+}
+#else
+static void ioperf(struct smb2_context *smb2, const char *op, const char *phase, uint64_t mid)
+{
+        (void)smb2;
+        (void)op;
+        (void)phase;
+        (void)mid;
+}
+#endif
+
 static int open_path(struct inas_handle *h, int rootfd, const char *smb_name,
                      struct smb2_create_request *req, struct stat *st);
 static int handle_free(struct inas_state *fs, struct inas_handle *h, int send_notify);
@@ -436,6 +477,8 @@ static void io_op_finish(struct inas_state *fs, struct inas_io_completion *op)
         struct smb2_pdu *pdu = NULL;
         char line[96];
 
+        ioperf(smb2, op->kind == IO_SETINFO ? "SETINFO" : (op->is_read ? "READ" : "WRITE"), "done",
+               op->message_id);
         if (!op->target->dead) {
                 if (op->kind == IO_SETINFO) {
                         if (op->status == 0) {
@@ -1339,6 +1382,8 @@ static int pipe_run_rpc(struct inas_state *fs, struct inas_handle *h, const uint
 static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                       struct smb2_create_request *req, struct smb2_create_reply *rep)
 {
+
+        ioperf(smb2, "CREATE", "entry", smb2_get_last_request_message_id(smb2));
         struct inas_state *fs = fs_state(srvr);
         const char *name = req->name ? req->name : "";
         uint32_t tid = smb2_tree_id(smb2);
@@ -1408,6 +1453,8 @@ static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
 static int close_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                      struct smb2_close_request *req, struct smb2_close_reply *rep)
 {
+
+        ioperf(smb2, "CLOSE", "entry", smb2_get_last_request_message_id(smb2));
         struct inas_state *fs = fs_state(srvr);
         (void)smb2;
         pthread_mutex_lock(&fs->lock);
@@ -1457,6 +1504,8 @@ static int flush_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
 static int read_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                     struct smb2_read_request *req, struct smb2_read_reply *rep)
 {
+
+        ioperf(smb2, "READ", "entry", smb2_get_last_request_message_id(smb2));
         struct inas_state *fs = fs_state(srvr);
         (void)smb2;
         pthread_mutex_lock(&fs->lock);
@@ -1563,6 +1612,8 @@ static int read_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
 static int write_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                      struct smb2_write_request *req, struct smb2_write_reply *rep)
 {
+
+        ioperf(smb2, "WRITE", "entry", smb2_get_last_request_message_id(smb2));
         struct inas_state *fs = fs_state(srvr);
         (void)smb2;
         pthread_mutex_lock(&fs->lock);
@@ -1663,6 +1714,8 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                                struct smb2_query_directory_request *req,
                                struct smb2_query_directory_reply *rep)
 {
+
+        ioperf(smb2, "QDIR", "entry", smb2_get_last_request_message_id(smb2));
         struct inas_state *fs = fs_state(srvr);
         (void)smb2;
         pthread_mutex_lock(&fs->lock);
@@ -1864,6 +1917,8 @@ static int fill_standard(const struct stat *st, struct smb2_file_standard_info *
 static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                           struct smb2_query_info_request *req, struct smb2_query_info_reply *rep)
 {
+
+        ioperf(smb2, "QINFO", "entry", smb2_get_last_request_message_id(smb2));
         struct inas_state *fs = fs_state(srvr);
         char namebuf[256];
         namebuf[0] = '\0';
@@ -2177,6 +2232,8 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
 static int set_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         struct smb2_set_info_request *req)
 {
+
+        ioperf(smb2, "SETINFO", "entry", smb2_get_last_request_message_id(smb2));
         struct inas_state *fs = fs_state(srvr);
         pthread_mutex_lock(&fs->lock);
         struct inas_handle *h = handle_lookup(fs, req->file_id);
