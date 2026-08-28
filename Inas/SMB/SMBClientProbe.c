@@ -2170,4 +2170,73 @@ out:
         return rc;
 }
 
+int inas_smb_client_stream_roundtrip(const char *host, uint16_t port, const char *user,
+                                     const char *password, const char *share, char *err, int errlen)
+{
+        struct smb2_context *smb2;
+        struct smb2fh *fh;
+        const char payload[] = "stream-payload";
+        char buf[64];
+        int n;
+        int rc = -1;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+
+        fh = smb2_open(smb2, "stream-blob.bin", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create base file failed");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+
+        fh = smb2_open(smb2, "stream-blob.bin:com.inas.test", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "open stream for write failed");
+                goto out;
+        }
+        if (smb2_pwrite(smb2, fh, (const uint8_t *)payload, (uint32_t)strlen(payload), 0) < 0) {
+                set_err(err, errlen, smb2, "stream write failed");
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        smb2_close(smb2, fh);
+
+        fh = smb2_open(smb2, "stream-blob.bin:com.inas.test", O_RDONLY);
+        if (!fh) {
+                set_err(err, errlen, smb2, "reopen stream failed");
+                goto out;
+        }
+        memset(buf, 0, sizeof(buf));
+        n = smb2_pread(smb2, fh, (uint8_t *)buf, sizeof(buf) - 1, 0);
+        smb2_close(smb2, fh);
+        if (n != (int)strlen(payload) || memcmp(buf, payload, (size_t)n) != 0) {
+                set_err(err, errlen, NULL, "stream read mismatch");
+                goto out;
+        }
+
+        if (smb2_unlink(smb2, "stream-blob.bin") != 0) {
+                set_err(err, errlen, smb2, "unlink base file failed");
+                goto out;
+        }
+        fh = smb2_open(smb2, "stream-blob.bin:com.inas.test", O_RDONLY);
+        if (fh) {
+                smb2_close(smb2, fh);
+                set_err(err, errlen, NULL, "stream survived base unlink");
+                goto out;
+        }
+
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        if (smb2) {
+                smb2_unlink(smb2, "stream-blob.bin");
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        return rc;
+}
+
 #endif /* DEBUG */

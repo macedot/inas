@@ -45,6 +45,7 @@
 #ifdef __APPLE__
 #include <os/log.h>
 #include <sys/attr.h>
+#include <sys/xattr.h>
 #endif
 
 #define INAS_MAX_HANDLES 256
@@ -89,6 +90,12 @@ struct inas_handle {
         int enum_done;
         uint32_t access;
         int is_pipe;
+        /* Named-stream handle ("path:stream"). fd/dirfd/leaf point at the
+         * base file; the stream payload lives in an xattr named `stream`
+         * on that file. macOS uses this instead of "._" AppleDouble files
+         * when the share advertises FILE_NAMED_STREAMS. */
+        int is_stream;
+        char stream[160];
         int wrote;
         uint32_t create_action;
         uint8_t *rpc_out;
@@ -495,7 +502,16 @@ static void io_op_finish(struct inas_state *fs, struct inas_io_completion *op)
                 } else if (op->is_read) {
                         struct smb2_read_reply rep;
                         memset(&rep, 0, sizeof(rep));
-                        if (op->status >= 0) {
+                        if (op->status == 0) {
+                                /* Zero bytes for a nonzero request is EOF.
+                                 * macOS fcopyfile hot-loops on SUCCESS+0
+                                 * replies; Samba returns END_OF_FILE (and
+                                 * libsmb2 clients treat it as 0 bytes). */
+                                struct smb2_error_reply err;
+                                memset(&err, 0, sizeof(err));
+                                pdu = smb2_cmd_error_reply_async(
+                                    smb2, &err, SMB2_READ, SMB2_STATUS_END_OF_FILE, NULL, NULL);
+                        } else if (op->status > 0) {
                                 rep.data = op->buf;
                                 rep.data_length = (uint32_t)op->status;
                                 rep.data_remaining = 0;
@@ -804,11 +820,17 @@ static int handle_free(struct inas_state *fs, struct inas_handle *h, int send_no
                 closedir(h->dir);
                 h->dir = NULL;
         }
+        if (h->is_stream && h->delete_on_close && !h->unlinked && h->fd >= 0) {
+                /* Stream delete-on-close drops the xattr while the base
+                 * fd is still open (needs the fd for fremovexattr). */
+                (void)fremovexattr(h->fd, h->stream, 0);
+                h->unlinked = 1;
+        }
         if (h->fd >= 0) {
                 close(h->fd);
                 h->fd = -1;
         }
-        if (h->delete_on_close && !h->unlinked && h->dirfd >= 0 && h->leaf[0]) {
+        if (!h->is_stream && h->delete_on_close && !h->unlinked && h->dirfd >= 0 && h->leaf[0]) {
                 if (unlinkat(h->dirfd, h->leaf, h->is_dir ? AT_REMOVEDIR : 0) != 0) {
                         if (errno != ENOENT) {
                                 rc = -errno;
@@ -1379,6 +1401,126 @@ static int pipe_run_rpc(struct inas_state *fs, struct inas_handle *h, const uint
         return 0;
 }
 
+/* ---- SMB2 "AAPL" create context (Apple SMB2 extensions) ---------------
+ *
+ * Without the AAPL handshake macOS smbfs stores all metadata (Finder
+ * info, xattrs) in "._<name>" AppleDouble files beside every file.
+ * After a successful handshake it uses named streams instead, matching
+ * Samba's vfs_fruit (wire format from libcli/smb/smb2_create_ctx.h). */
+#define INAS_AAPL_CMD_SERVER_QUERY 1
+#define INAS_AAPL_REQ_SERVER_CAPS 0x01
+#define INAS_AAPL_REQ_VOLUME_CAPS 0x02
+#define INAS_AAPL_REQ_MODEL_INFO 0x04
+#define INAS_AAPL_CAP_UNIX_BASED 0x04
+
+/* Walk a create-context blob looking for "AAPL". The name is 4 ASCII
+ * bytes on the wire (Apple form) or UTF-16 (Samba client form). On
+ * success *data/*data_len describe the payload, which macOS sends
+ * EMPTY (pure capability probe). */
+static int aapl_context_find(const uint8_t *cc, uint32_t cc_len, const uint8_t **data,
+                             uint32_t *data_len)
+{
+        static const uint8_t aapl_ascii[4] = {'A', 'A', 'P', 'L'};
+        static const uint8_t aapl_utf16[8] = {'A', 0, 'A', 0, 'P', 0, 'L', 0};
+        uint32_t off = 0;
+
+        while (off + 16 <= cc_len) {
+                struct smb2_iovec v = {
+                    .buf = (uint8_t *)cc + off,
+                    .len = cc_len - off,
+                };
+                uint32_t next = 0, dlen = 0;
+                uint16_t name_off = 0, name_len = 0, data_off = 0;
+
+                smb2_get_uint32(&v, 0, &next);
+                smb2_get_uint16(&v, 4, &name_off);
+                smb2_get_uint16(&v, 6, &name_len);
+                smb2_get_uint16(&v, 10, &data_off);
+                smb2_get_uint32(&v, 12, &dlen);
+                if (name_off + name_len <= cc_len - off && data_off + dlen <= cc_len - off &&
+                    ((name_len == 4 && memcmp(cc + off + name_off, aapl_ascii, 4) == 0) ||
+                     (name_len == 8 && memcmp(cc + off + name_off, aapl_utf16, 8) == 0))) {
+                        *data = cc + off + data_off;
+                        *data_len = dlen;
+                        return 1;
+                }
+                if (next < 16 || off + next > cc_len) {
+                        break;
+                }
+                off += next;
+        }
+        return 0;
+}
+
+/* Build the AAPL reply create context. Serve-thread only; out must be
+ * >= 80 bytes and must outlive the reply encoder (it memcpy's out).
+ * Name is the Apple 4-byte ASCII form; sections follow the bitmap. */
+static uint32_t aapl_reply_build(uint8_t *out, uint64_t req_bitmap)
+{
+        struct smb2_iovec v = {.buf = out, .len = 80};
+        uint32_t data_len = 16;
+
+        memset(out, 0, 80);
+        smb2_set_uint32(&v, 4, 16);  /* NameOffset */
+        smb2_set_uint16(&v, 6, 4);   /* NameLength ("AAPL" ASCII) */
+        smb2_set_uint16(&v, 10, 24); /* DataOffset */
+        memcpy(out + 16, "AAPL", 4);
+        smb2_set_uint32(&v, 24, INAS_AAPL_CMD_SERVER_QUERY);
+        smb2_set_uint64(&v, 32, req_bitmap);
+        if (req_bitmap & INAS_AAPL_REQ_SERVER_CAPS) {
+                smb2_set_uint64(&v, 24 + data_len, INAS_AAPL_CAP_UNIX_BASED);
+                data_len += 8;
+        }
+        if (req_bitmap & INAS_AAPL_REQ_VOLUME_CAPS) {
+                smb2_set_uint64(&v, 24 + data_len, 0);
+                data_len += 8;
+        }
+        if (req_bitmap & INAS_AAPL_REQ_MODEL_INFO) {
+                static const uint8_t model[8] = {'i', 0, 'N', 0, 'A', 0, 'S', 0};
+                smb2_set_uint32(&v, 24 + data_len, 0);
+                smb2_set_uint32(&v, 28 + data_len, 8);
+                memcpy(out + 32 + data_len, model, 8);
+                data_len += 16;
+        }
+        smb2_set_uint32(&v, 12, data_len);
+        return 24 + ((data_len + 7) & ~7u);
+}
+
+/* Attach the AAPL reply to a CREATE reply when the client asked for the
+ * handshake. blob/backing must persist until the reply PDU is encoded
+ * (same select-loop iteration). */
+static void aapl_maybe_reply(struct smb2_context *smb2, struct smb2_create_request *req,
+                             struct smb2_create_reply *rep)
+{
+        static uint8_t backing[80];
+        const uint8_t *data = NULL;
+        uint32_t data_len = 0;
+        struct smb2_iovec v;
+
+        if (!req->create_context_length || !req->create_context) {
+                return;
+        }
+        if (!aapl_context_find(req->create_context, req->create_context_length, &data, &data_len)) {
+                return;
+        }
+        /* macOS probes with an empty payload; Samba's smbclient sends the
+         * 24-byte query form (cmd, pad, bitmap, client caps). */
+        uint64_t bitmap =
+            INAS_AAPL_REQ_SERVER_CAPS | INAS_AAPL_REQ_VOLUME_CAPS | INAS_AAPL_REQ_MODEL_INFO;
+        if (data_len >= 24 && data + 24 <= req->create_context + req->create_context_length) {
+                v.buf = (uint8_t *)data;
+                v.len = data_len;
+                uint32_t cmd = 0;
+                smb2_get_uint32(&v, 0, &cmd);
+                smb2_get_uint64(&v, 8, &bitmap);
+                if (cmd != INAS_AAPL_CMD_SERVER_QUERY) {
+                        return;
+                }
+        }
+        rep->create_context_length = aapl_reply_build(backing, bitmap);
+        rep->create_context = backing;
+}
+
 static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                       struct smb2_create_request *req, struct smb2_create_reply *rep)
 {
@@ -1412,6 +1554,97 @@ static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 return -EBADF;
         }
 
+        /* Named stream: "path:stream" (optional ":$DATA" type suffix).
+         * The base path opens like any other file; the stream payload is
+         * an xattr on it (this is what stops macOS from writing ._ files
+         * once FILE_NAMED_STREAMS is advertised). */
+        const char *colon = strchr(name, ':');
+        if (colon != NULL && (colon != name || colon[1] != '\0')) {
+                char base[512];
+                char stream[160]; /* matches inas_handle.stream */
+                size_t blen = (size_t)(colon - name);
+                size_t slen;
+                struct smb2_create_request breq;
+                struct stat st;
+                struct inas_handle *h;
+                ssize_t xlen;
+                int err;
+
+                if (blen >= sizeof(base)) {
+                        return -ENOENT;
+                }
+                memcpy(base, name, blen);
+                base[blen] = '\0';
+                snprintf(stream, sizeof(stream), "%s", colon + 1);
+                slen = strlen(stream);
+                if (slen > 6 && strcasecmp(stream + slen - 6, ":$DATA") == 0) {
+                        stream[slen - 6] = '\0';
+                }
+                if (!stream[0]) {
+                        return -EINVAL;
+                }
+
+                pthread_mutex_lock(&fs->lock);
+                h = handle_alloc(fs, smb2);
+                if (!h) {
+                        pthread_mutex_unlock(&fs->lock);
+                        return -ENOMEM;
+                }
+                breq = *req;
+                breq.name = base;
+                breq.desired_access |= SMB2_FILE_READ_DATA | SMB2_FILE_WRITE_DATA;
+                breq.create_disposition = SMB2_FILE_OPEN;
+                breq.create_options &= ~(uint32_t)SMB2_FILE_DIRECTORY_FILE;
+                err = open_path(h, rootfd, base, &breq, &st);
+                if (err != 0) {
+                        handle_free(fs, h, 0);
+                        pthread_mutex_unlock(&fs->lock);
+                        return err;
+                }
+                h->is_stream = 1;
+                snprintf(h->stream, sizeof(h->stream), "%s", stream);
+                xlen = h->fd >= 0 ? fgetxattr(h->fd, h->stream, NULL, 0, 0, 0) : -1;
+                switch (req->create_disposition) {
+                case SMB2_FILE_OPEN:
+                        if (xlen < 0) {
+                                handle_free(fs, h, 0);
+                                pthread_mutex_unlock(&fs->lock);
+                                return -ENOENT;
+                        }
+                        h->create_action = 1;
+                        break;
+                case SMB2_FILE_CREATE:
+                        if (xlen >= 0) {
+                                handle_free(fs, h, 0);
+                                pthread_mutex_unlock(&fs->lock);
+                                return -EEXIST;
+                        }
+                        h->create_action = 2;
+                        break;
+                case SMB2_FILE_OVERWRITE:
+                case SMB2_FILE_OVERWRITE_IF:
+                case SMB2_FILE_SUPERSEDE:
+                        if (xlen >= 0 && fremovexattr(h->fd, h->stream, 0) != 0) {
+                                err = -errno;
+                                handle_free(fs, h, 0);
+                                pthread_mutex_unlock(&fs->lock);
+                                return err;
+                        }
+                        h->create_action = xlen >= 0 ? 3 : 2;
+                        xlen = 0;
+                        break;
+                default: /* OPEN_IF */
+                        h->create_action = xlen >= 0 ? 1 : 2;
+                        break;
+                }
+                fill_create_reply(rep, h, &st);
+                rep->end_of_file = xlen > 0 ? (uint64_t)xlen : 0;
+                rep->allocation_size = rep->end_of_file;
+                aapl_maybe_reply(smb2, req, rep);
+                pthread_mutex_unlock(&fs->lock);
+                return 0;
+        }
+
         /* Finder often CREATE's the share name as a child of the tree.
          * If there is no real child with that name, treat it as the root. */
         const char *open_name = name;
@@ -1443,6 +1676,7 @@ static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 return err;
         }
         fill_create_reply(rep, h, &st);
+        aapl_maybe_reply(smb2, req, rep);
         if (h->create_action == 2) {
                 notify_mark(fs);
         }
@@ -1538,6 +1772,57 @@ static int read_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 rep->data_length = n;
                 return 0;
         }
+        if (h->is_stream) {
+                /* Stream payload lives in one xattr; serve reads from it. */
+                uint8_t *whole = NULL;
+                uint8_t *buf = NULL;
+                ssize_t xl = h->fd >= 0 ? fgetxattr(h->fd, h->stream, NULL, 0, 0, 0) : -1;
+                uint32_t n = 0;
+
+                if (xl > 0 && req->offset < (uint64_t)xl) {
+                        whole = malloc((size_t)xl);
+                        if (whole && fgetxattr(h->fd, h->stream, whole, (size_t)xl, 0, 0) == xl) {
+                                n = (uint32_t)((uint64_t)xl - req->offset);
+                                if (n > req->length) {
+                                        n = req->length;
+                                }
+                                buf = malloc(n ? n : 1);
+                                if (buf) {
+                                        memcpy(buf, whole + req->offset, n);
+                                } else {
+                                        n = 0;
+                                }
+                        } else {
+                                n = 0;
+                        }
+                        free(whole);
+                }
+                pthread_mutex_unlock(&fs->lock);
+                if (n == 0 && req->length > 0) {
+                        /* EOF on a stream read: same Samba-style
+                         * END_OF_FILE reply as the data-fork paths. */
+                        struct smb2_error_reply err;
+                        struct smb2_pdu *epdu;
+
+                        memset(&err, 0, sizeof(err));
+                        epdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_READ,
+                                                          SMB2_STATUS_END_OF_FILE, NULL, NULL);
+                        if (epdu != NULL) {
+                                smb2_set_pdu_message_id(smb2, epdu,
+                                                        smb2_get_last_request_message_id(smb2));
+                                smb2_queue_pdu(smb2, epdu);
+                                return 1;
+                        }
+                }
+                rep->data = buf;
+                rep->data_length = n;
+                rep->data_remaining = 0;
+                if (n) {
+                        atomic_fetch_add(&fs->bytes, (uint64_t)n);
+                        atomic_fetch_add(&fs->bytes_read, (uint64_t)n);
+                }
+                return 0;
+        }
         if (h->fd < 0) {
                 pthread_mutex_unlock(&fs->lock);
                 return -EBADF;
@@ -1596,6 +1881,20 @@ static int read_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         }
         if (n == 0) {
                 free(buf);
+                /* Zero bytes for a nonzero request is EOF. macOS
+                 * hot-loops on SUCCESS+0; Samba replies END_OF_FILE
+                 * (libsmb2 clients treat it as 0 bytes). */
+                struct smb2_error_reply err;
+                struct smb2_pdu *epdu;
+
+                memset(&err, 0, sizeof(err));
+                epdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_READ, SMB2_STATUS_END_OF_FILE,
+                                                  NULL, NULL);
+                if (epdu != NULL) {
+                        smb2_set_pdu_message_id(smb2, epdu, smb2_get_last_request_message_id(smb2));
+                        smb2_queue_pdu(smb2, epdu);
+                        return 1;
+                }
                 rep->data = NULL;
                 rep->data_length = 0;
                 rep->data_remaining = 0;
@@ -1630,6 +1929,54 @@ static int write_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 }
                 rep->count = req->length;
                 rep->remaining = 0;
+                return 0;
+        }
+        if (h->is_stream) {
+                /* Whole-xattr read-modify-write. Streams are small
+                 * (Finder info, metadata); each WRITE lands as one
+                 * setxattr so the client always reads back its writes. */
+                int rc = 0;
+
+                if (req->length > 0) {
+                        size_t total;
+                        uint8_t *whole;
+                        ssize_t xl = h->fd >= 0 ? fgetxattr(h->fd, h->stream, NULL, 0, 0, 0) : -1;
+
+                        if (xl < 0) {
+                                xl = 0;
+                        }
+                        total = (size_t)xl;
+                        if (req->offset + req->length > total) {
+                                total = req->offset + req->length;
+                        }
+                        whole = calloc(1, total);
+                        if (!whole) {
+                                pthread_mutex_unlock(&fs->lock);
+                                return -ENOMEM;
+                        }
+                        if (xl > 0 && fgetxattr(h->fd, h->stream, whole, (size_t)xl, 0, 0) != xl) {
+                                free(whole);
+                                pthread_mutex_unlock(&fs->lock);
+                                return -EIO;
+                        }
+                        memcpy(whole + req->offset, req->buf, req->length);
+                        if (fsetxattr(h->fd, h->stream, whole, total, 0, 0) != 0) {
+                                rc = -errno;
+                        }
+                        free(whole);
+                        if (rc != 0) {
+                                pthread_mutex_unlock(&fs->lock);
+                                return rc;
+                        }
+                        h->wrote = 1;
+                }
+                pthread_mutex_unlock(&fs->lock);
+                rep->count = req->length;
+                rep->remaining = 0;
+                if (req->length) {
+                        atomic_fetch_add(&fs->bytes, (uint64_t)req->length);
+                        atomic_fetch_add(&fs->bytes_written, (uint64_t)req->length);
+                }
                 return 0;
         }
         if (h->fd < 0) {
@@ -1972,6 +2319,11 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         if (!p)
                                 return -1;
                         len = fill_standard(&st, p, delete_pending);
+                        if (h->is_stream && h->fd >= 0) {
+                                ssize_t xl = fgetxattr(h->fd, h->stream, NULL, 0, 0, 0);
+                                p->end_of_file = xl > 0 ? (uint64_t)xl : 0;
+                                p->allocation_size = p->end_of_file;
+                        }
                         info = p;
                         break;
                 }
@@ -2012,6 +2364,11 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                                 return -1;
                         fill_basic(&st, &p->basic);
                         fill_standard(&st, &p->standard, delete_pending);
+                        if (h->is_stream && h->fd >= 0) {
+                                ssize_t xl = fgetxattr(h->fd, h->stream, NULL, 0, 0, 0);
+                                p->standard.end_of_file = xl > 0 ? (uint64_t)xl : 0;
+                                p->standard.allocation_size = p->standard.end_of_file;
+                        }
                         p->index_number = inas_file_id(&st);
                         p->access_flags = 0x001f01ff;
                         char *stored = (char *)(p + 1);
@@ -2159,8 +2516,8 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         struct smb2_file_fs_attribute_info *p = calloc(1, sizeof(*p));
                         if (!p)
                                 return -1;
-                        /* CASE_PRESERVED_NAMES | UNICODE_ON_DISK */
-                        p->filesystem_attributes = 0x00000006;
+                        /* CASE_PRESERVED_NAMES | UNICODE_ON_DISK | FILE_NAMED_STREAMS */
+                        p->filesystem_attributes = 0x00040006;
                         p->maximum_component_name_length = 255;
                         p->filesystem_name = (const uint8_t *)"iNAS";
                         p->filesystem_name_length = 8;
@@ -2256,6 +2613,19 @@ static int set_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                                 /* Cannot undelete a name already unlinked. */
                                 if (!h->unlinked) {
                                         h->delete_on_close = 0;
+                                }
+                                break;
+                        }
+                        if (h->is_stream) {
+                                /* Deleting a stream removes just the xattr,
+                                 * never the base file. */
+                                if (h->fd >= 0 && fremovexattr(h->fd, h->stream, 0) != 0 &&
+                                    errno != ENOATTR) {
+                                        rc = -errno;
+                                } else {
+                                        h->delete_on_close = 1;
+                                        h->unlinked = 1;
+                                        notify_mark(fs);
                                 }
                                 break;
                         }

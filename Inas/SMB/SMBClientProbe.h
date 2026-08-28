@@ -124,6 +124,11 @@ int inas_smb_client_two_sessions_count(const char *host, uint16_t port, const ch
 int inas_smb_client_setinfo_times(const char *host, uint16_t port, const char *user,
                                   const char *password, const char *share, char *err, int errlen);
 
+/* Named streams ("file:stream") must round-trip and die with the base file. */
+int inas_smb_client_stream_roundtrip(const char *host, uint16_t port, const char *user,
+                                     const char *password, const char *share, char *err,
+                                     int errlen);
+
 #endif /* DEBUG */
 
 #ifdef __cplusplus

@@ -390,6 +390,16 @@ final class SMBLoopbackTests: XCTestCase {
         )
     }
 
+    func testStreamsRoundTrip() throws {
+        let port = try startServer()
+        var err = [CChar](repeating: 0, count: 256)
+        XCTAssertEqual(
+            inas_smb_client_stream_roundtrip("127.0.0.1", port, "inas", "correct1", "inas", &err, Int32(err.count)),
+            0,
+            String(cString: err)
+        )
+    }
+
     private func openFDCount() -> Int? {
         try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
     }
