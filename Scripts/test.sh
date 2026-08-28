@@ -36,31 +36,13 @@ else
   echo "swift-format: not installed, skipping"
 fi
 
-pick_destination() {
-  python3 - <<'PY'
-import json, subprocess, sys
-raw = subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"])
-data = json.loads(raw)
-preferred = ["iPhone 17", "iPhone 16", "iPhone 16 Pro", "iPhone 15 Pro", "iPhone 15"]
-found = []
-for runtime, devices in data.get("devices", {}).items():
-    if "iOS" not in runtime:
-        continue
-    for dev in devices:
-        if dev.get("isAvailable") and "iPhone" in dev.get("name", ""):
-            found.append(dev["name"])
-for name in preferred:
-    if name in found:
-        print(f"platform=iOS Simulator,name={name}")
-        sys.exit(0)
-if found:
-    print(f"platform=iOS Simulator,name={found[0]}")
-    sys.exit(0)
-sys.exit("no available iPhone simulator")
-PY
-}
-
-DESTINATION="${DESTINATION:-$(pick_destination)}"
+# Physical iPhone only. Never fall back to a simulator.
+IPHONE_UDID="${IPHONE_UDID:-00008130-001C78EC18EB8D3A}"
+if ! xcrun devicectl device info details --device "$IPHONE_UDID" >/dev/null 2>&1; then
+  echo "test.sh: physical iPhone $IPHONE_UDID is not connected" >&2
+  exit 1
+fi
+DESTINATION="${DESTINATION:-platform=iOS,id=$IPHONE_UDID}"
 echo "xcodebuild test destination: $DESTINATION"
 
 xcodebuild \

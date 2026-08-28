@@ -1,8 +1,8 @@
 diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Vendor/libsmb2/lib/libsmb2.c
-index 7cea093..10626d6 100644
+index 7cea093..5725a6f 100644
 --- a/Vendor/libsmb2/lib/libsmb2.c
 +++ b/Vendor/libsmb2/lib/libsmb2.c
-@@ -4905,6 +4905,13 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
+@@ -4905,6 +4905,22 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                                                  smb2_close_context(smb2);
                                          }
                                  }
@@ -12,6 +12,15 @@ index 7cea093..10626d6 100644
 +                                 * processed. extra_service is idempotent. */
 +                                if (server->extra_service) {
 +                                        server->extra_service(server, &rfds, &wfds);
++                                }
++                                /* Replies queued by extra_service were not in
++                                 * wfds at select(); flush them now. */
++                                if (SMB2_VALID_SOCKET(smb2_get_fd(smb2)) && smb2->outqueue) {
++                                        if (smb2_service(smb2, POLLOUT) < 0) {
++                                                smb2_set_error(smb2, "smb2_service (out-flush) failed with : "
++                                                                "%s", smb2_get_error(smb2));
++                                                smb2_close_context(smb2);
++                                        }
 +                                }
                                  if (!SMB2_VALID_SOCKET(smb2->fd) && ((time(NULL) - now) > (smb2->timeout)))
                                  {

@@ -4912,6 +4912,15 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                                 if (server->extra_service) {
                                         server->extra_service(server, &rfds, &wfds);
                                 }
+                                /* Replies queued by extra_service were not in
+                                 * wfds at select(); flush them now. */
+                                if (SMB2_VALID_SOCKET(smb2_get_fd(smb2)) && smb2->outqueue) {
+                                        if (smb2_service(smb2, POLLOUT) < 0) {
+                                                smb2_set_error(smb2, "smb2_service (out-flush) failed with : "
+                                                                "%s", smb2_get_error(smb2));
+                                                smb2_close_context(smb2);
+                                        }
+                                }
                                 if (!SMB2_VALID_SOCKET(smb2->fd) && ((time(NULL) - now) > (smb2->timeout)))
                                 {
                                         smb2_set_error(smb2, "Timeout expired and no connection exists");

@@ -102,6 +102,15 @@ int inas_smb_client_concurrent_copy_and_enum(const char *host, uint16_t port, co
                                              const char *password, const char *share, char *err,
                                              int errlen);
 
+/* Write 4×512KiB, read back, memcmp. Catches a stalled WRITE pipeline. */
+int inas_smb_client_transfer_verify(const char *host, uint16_t port, const char *user,
+                                    const char *password, const char *share, char *err, int errlen);
+
+/* Three connections: CREATE, SET_INFO-delete, QUERY_DIRECTORY on one folder. */
+int inas_smb_client_parallel_create_delete_list(const char *host, uint16_t port, const char *user,
+                                                const char *password, const char *share, char *err,
+                                                int errlen);
+
 #endif /* DEBUG */
 
 #ifdef __cplusplus

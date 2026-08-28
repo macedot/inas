@@ -146,6 +146,7 @@ struct inas_state {
         dispatch_queue_t io_worker_queue;
         dispatch_semaphore_t io_worker_gate;
         struct smb2_context *sessions[INAS_MAX_SESSIONS];
+        int notify_dirty;
         struct smb2_server server;
         inas_auth_slot auth[INAS_AUTH_PEERS];
         inas_auth_global auth_global;
@@ -509,8 +510,8 @@ static void notify_send(struct smb2_context *smb2, uint64_t message_id, uint32_t
 }
 
 /* Complete every outstanding CHANGE_NOTIFY. Finder watches displayed
- * folders; STATUS_NOTIFY_ENUM_DIR tells it to re-list. Called after
- * create/unlink/rename — never after a plain WRITE (.DS_Store). */
+ * folders; STATUS_NOTIFY_ENUM_DIR tells it to re-list. Flushed once per
+ * extra_service tick so a batch CREATE does not re-list after every file. */
 static void notify_complete_all(struct inas_state *fs, uint32_t status)
 {
         for (int i = 0; i < INAS_MAX_HANDLES; i++) {
@@ -522,6 +523,20 @@ static void notify_complete_all(struct inas_state *fs, uint32_t status)
                 h->notify_pending = 0;
                 h->notify_mid = 0;
         }
+}
+
+static void notify_mark(struct inas_state *fs)
+{
+        fs->notify_dirty = 1;
+}
+
+static void notify_flush(struct inas_state *fs)
+{
+        if (!fs->notify_dirty) {
+                return;
+        }
+        fs->notify_dirty = 0;
+        notify_complete_all(fs, SMB2_STATUS_NOTIFY_ENUM_DIR);
 }
 
 /* True if `fd` is a directory containing only "." / "..". 1 empty, 0 not,
@@ -604,7 +619,7 @@ static int handle_free(struct inas_state *fs, struct inas_handle *h, int send_no
                                 rc = -errno;
                         }
                 } else if (send_notify) {
-                        notify_complete_all(fs, SMB2_STATUS_NOTIFY_ENUM_DIR);
+                        notify_mark(fs);
                 }
         }
         if (h->dirfd >= 0) {
@@ -1168,11 +1183,9 @@ static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                 pthread_mutex_unlock(&fs->lock);
                 return -ENOMEM;
         }
-        pthread_mutex_unlock(&fs->lock);
         struct stat st;
         memset(&st, 0, sizeof(st));
         int err = open_path(h, rootfd, open_name, req, &st);
-        pthread_mutex_lock(&fs->lock);
         if (err != 0) {
                 handle_free(fs, h, 0);
                 pthread_mutex_unlock(&fs->lock);
@@ -1194,7 +1207,7 @@ static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         rep->create_action = h->create_action ? h->create_action : 1;
         rep->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
         if (h->create_action == 2) {
-                notify_complete_all(fs, SMB2_STATUS_NOTIFY_ENUM_DIR);
+                notify_mark(fs);
         }
         pthread_mutex_unlock(&fs->lock);
         return 0;
@@ -1501,11 +1514,6 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 }
         }
 
-        DIR *dir = h->dir;
-        int atfd = h->fd >= 0 ? h->fd : h->dirfd;
-        uint32_t enum_index = h->enum_index;
-        pthread_mutex_unlock(&fs->lock);
-
         const char *pattern = req->name ? req->name : "*";
         struct dirent *de;
         struct smb2_fileidbothdirectoryinformation *entries = NULL;
@@ -1515,12 +1523,12 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
         uint32_t padded_sum = 0;
 
         for (;;) {
-                long loc = telldir(dir);
+                long loc = telldir(h->dir);
                 uint32_t fname16;
                 uint32_t raw;
                 uint32_t total_if_last;
 
-                de = readdir(dir);
+                de = readdir(h->dir);
                 if (de == NULL) {
                         break;
                 }
@@ -1532,7 +1540,7 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 total_if_last = padded_sum + raw;
                 if (room && count > 0 && total_if_last > room) {
                         if (loc != -1) {
-                                seekdir(dir, loc);
+                                seekdir(h->dir, loc);
                         }
                         break;
                 }
@@ -1541,16 +1549,18 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                         void *nbuf = realloc(entries, cap * sizeof(*entries));
                         if (!nbuf) {
                                 free(entries);
+                                pthread_mutex_unlock(&fs->lock);
                                 return -1;
                         }
                         entries = nbuf;
                 }
                 struct stat st;
                 memset(&st, 0, sizeof(st));
+                int atfd = h->fd >= 0 ? h->fd : h->dirfd;
                 fstatat(atfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW);
                 struct smb2_fileidbothdirectoryinformation *e = &entries[count];
                 memset(e, 0, sizeof(*e));
-                e->file_index = enum_index + (uint32_t)count;
+                e->file_index = h->enum_index + (uint32_t)count;
                 stat_to_timeval(&st.st_birthtimespec, &e->creation_time);
                 stat_to_timeval(&st.st_atimespec, &e->last_access_time);
                 stat_to_timeval(&st.st_mtimespec, &e->last_write_time);
@@ -1571,6 +1581,7 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                                 free((void *)entries[i].name);
                         }
                         free(entries);
+                        pthread_mutex_unlock(&fs->lock);
                         return -1;
                 }
                 count++;
@@ -1579,18 +1590,10 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                         break;
                 }
         }
-
-        pthread_mutex_lock(&fs->lock);
-        h = handle_lookup(fs, req->file_id);
-        if (h) {
-                h->enum_index = enum_index + (uint32_t)count;
-                if (count == 0) {
-                        h->enum_done = 1;
-                }
-        }
-        pthread_mutex_unlock(&fs->lock);
-
+        h->enum_index += (uint32_t)count;
         if (count == 0) {
+                h->enum_done = 1;
+                pthread_mutex_unlock(&fs->lock);
                 rep->output_buffer = NULL;
                 rep->output_buffer_length = 0;
                 return 0;
@@ -1608,6 +1611,7 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                         free((void *)entries[i].name);
                 }
                 free(entries);
+                pthread_mutex_unlock(&fs->lock);
                 return -1;
         }
         char *nptr = (char *)(buf + packed);
@@ -1622,6 +1626,7 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 free((void *)entries[i].name);
         }
         free(entries);
+        pthread_mutex_unlock(&fs->lock);
         rep->output_buffer = buf;
         rep->output_buffer_length = (uint32_t)packed;
         return 0;
@@ -2025,7 +2030,7 @@ static int set_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         if (h) {
                                 h->delete_on_close = 1;
                                 h->unlinked = 1;
-                                notify_complete_all(fs, SMB2_STATUS_NOTIFY_ENUM_DIR);
+                                notify_mark(fs);
                         }
                         break;
                 }
@@ -2076,7 +2081,7 @@ static int set_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         dest.dirfd = -1;
                         snprintf(h->leaf, sizeof(h->leaf), "%s", dest.name);
                         inas_path_release(&dest);
-                        notify_complete_all(fs, SMB2_STATUS_NOTIFY_ENUM_DIR);
+                        notify_mark(fs);
                         break;
                 }
                 case SMB2_FILE_BASIC_INFORMATION:
@@ -2302,6 +2307,7 @@ static void extra_service(struct smb2_server *server, fd_set *rfds, fd_set *wfds
                 } while (n > 0 || (n < 0 && errno == EINTR));
                 io_drain(fs);
         }
+        notify_flush(fs);
 }
 
 static void close_share_fds(void)
@@ -2404,6 +2410,7 @@ int inas_smb_start(const inas_smb_config *config)
         atomic_store(&g.peak_clients, 0);
         atomic_store(&g.active_transfers, 0);
         memset(g.sessions, 0, sizeof(g.sessions));
+        g.notify_dirty = 0;
         memset(g.auth, 0, sizeof(g.auth));
         memset(&g.auth_global, 0, sizeof(g.auth_global));
         for (int i = 0; i < INAS_MAX_SHARES; i++) {

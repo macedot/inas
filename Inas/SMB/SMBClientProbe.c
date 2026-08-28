@@ -1681,4 +1681,261 @@ out:
         return rc;
 }
 
+int inas_smb_client_transfer_verify(const char *host, uint16_t port, const char *user,
+                                    const char *password, const char *share, char *err, int errlen)
+{
+        struct smb2_context *smb2;
+        struct smb2fh *fh;
+        uint8_t *wbuf = NULL;
+        uint8_t *rbuf = NULL;
+        const uint32_t chunk = 512 * 1024;
+        const int chunks = 4;
+        int i;
+        int rc = -1;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+        wbuf = malloc(chunk);
+        rbuf = malloc(chunk);
+        if (!wbuf || !rbuf) {
+                set_err(err, errlen, NULL, "malloc failed");
+                goto out;
+        }
+        fh = smb2_open(smb2, "xfer-verify.bin", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create xfer-verify.bin failed");
+                goto out;
+        }
+        for (i = 0; i < chunks; i++) {
+                memset(wbuf, 0xa0 + i, chunk);
+                if (smb2_pwrite(smb2, fh, wbuf, chunk, (uint64_t)i * chunk) != (int)chunk) {
+                        set_err(err, errlen, smb2, "pwrite xfer-verify.bin failed");
+                        smb2_close(smb2, fh);
+                        goto out;
+                }
+        }
+        smb2_close(smb2, fh);
+        fh = smb2_open(smb2, "xfer-verify.bin", O_RDONLY);
+        if (!fh) {
+                set_err(err, errlen, smb2, "reopen xfer-verify.bin failed");
+                goto out;
+        }
+        for (i = 0; i < chunks; i++) {
+                memset(wbuf, 0xa0 + i, chunk);
+                memset(rbuf, 0, chunk);
+                if (smb2_pread(smb2, fh, rbuf, chunk, (uint64_t)i * chunk) != (int)chunk ||
+                    memcmp(wbuf, rbuf, chunk) != 0) {
+                        set_err(err, errlen, smb2, "pread mismatch on xfer-verify.bin");
+                        smb2_close(smb2, fh);
+                        goto out;
+                }
+        }
+        smb2_close(smb2, fh);
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        if (smb2) {
+                smb2_unlink(smb2, "xfer-verify.bin");
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        free(wbuf);
+        free(rbuf);
+        return rc;
+}
+
+struct par_ctl {
+        const char *host;
+        uint16_t port;
+        const char *user;
+        const char *password;
+        const char *share;
+        volatile int stop;
+        volatile int creates;
+        volatile int deletes;
+        volatile int lists;
+        volatile int failed;
+        char err[256];
+};
+
+static void *par_create_thread(void *arg)
+{
+        struct par_ctl *c = arg;
+        struct smb2_context *smb2 = open_share(c->host, c->port, c->user, c->password, c->share, 0,
+                                               c->err, (int)sizeof(c->err));
+        int n = 0;
+
+        if (!smb2) {
+                c->failed = 1;
+                return NULL;
+        }
+        while (!c->stop) {
+                char name[64];
+                struct smb2fh *fh;
+
+                snprintf(name, sizeof(name), "par/c-%d.txt", n++);
+                fh = smb2_open(smb2, name, O_RDWR | O_CREAT);
+                if (!fh) {
+                        snprintf(c->err, sizeof(c->err), "create %s failed", name);
+                        c->failed = 1;
+                        break;
+                }
+                smb2_close(smb2, fh);
+                c->creates++;
+        }
+        smb2_disconnect_share(smb2);
+        smb2_destroy_context(smb2);
+        return NULL;
+}
+
+static void *par_delete_thread(void *arg)
+{
+        struct par_ctl *c = arg;
+        struct smb2_context *smb2 = open_share(c->host, c->port, c->user, c->password, c->share, 0,
+                                               c->err, (int)sizeof(c->err));
+        int n = 0;
+
+        if (!smb2) {
+                c->failed = 1;
+                return NULL;
+        }
+        while (!c->stop) {
+                char name[64];
+                struct smb2fh *fh;
+                struct smb2_set_info_request sr;
+                struct smb2_file_disposition_info fdi;
+                struct raw_status rs;
+
+                snprintf(name, sizeof(name), "par/d-%d.txt", n++);
+                fh = smb2_open(smb2, name, O_RDWR | O_CREAT);
+                if (!fh) {
+                        snprintf(c->err, sizeof(c->err), "create-for-delete %s failed", name);
+                        c->failed = 1;
+                        break;
+                }
+                memset(&sr, 0, sizeof(sr));
+                sr.info_type = SMB2_0_INFO_FILE;
+                sr.file_info_class = SMB2_FILE_DISPOSITION_INFORMATION;
+                memcpy(sr.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+                fdi.delete_pending = 1;
+                sr.input_data = &fdi;
+                if (run_until_status(smb2, smb2_cmd_set_info_async(smb2, &sr, raw_cb, &rs), &rs,
+                                     "par delete", c->err, (int)sizeof(c->err)) != 0 ||
+                    rs.status != 0) {
+                        smb2_close(smb2, fh);
+                        c->failed = 1;
+                        break;
+                }
+                smb2_close(smb2, fh);
+                c->deletes++;
+        }
+        smb2_disconnect_share(smb2);
+        smb2_destroy_context(smb2);
+        return NULL;
+}
+
+static void *par_list_thread(void *arg)
+{
+        struct par_ctl *c = arg;
+        struct smb2_context *smb2 = open_share(c->host, c->port, c->user, c->password, c->share, 0,
+                                               c->err, (int)sizeof(c->err));
+
+        if (!smb2) {
+                c->failed = 1;
+                return NULL;
+        }
+        while (!c->stop) {
+                struct smb2dir *dir = smb2_opendir(smb2, "par");
+                if (!dir) {
+                        snprintf(c->err, sizeof(c->err), "opendir par failed: %s",
+                                 smb2_get_error(smb2));
+                        c->failed = 1;
+                        break;
+                }
+                while (smb2_readdir(smb2, dir)) {
+                }
+                smb2_closedir(smb2, dir);
+                c->lists++;
+        }
+        smb2_disconnect_share(smb2);
+        smb2_destroy_context(smb2);
+        return NULL;
+}
+
+int inas_smb_client_parallel_create_delete_list(const char *host, uint16_t port, const char *user,
+                                                const char *password, const char *share, char *err,
+                                                int errlen)
+{
+        struct par_ctl c;
+        pthread_t tc, td, tl;
+        struct smb2_context *smb2;
+        int rc = -1;
+
+        memset(&c, 0, sizeof(c));
+        c.host = host;
+        c.port = port;
+        c.user = user;
+        c.password = password;
+        c.share = share;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+        if (smb2_mkdir(smb2, "par") != 0 &&
+            smb2_get_nterror(smb2) != SMB2_STATUS_OBJECT_NAME_COLLISION) {
+                /* mkdir may fail if it exists; try going on. */
+        }
+        smb2_disconnect_share(smb2);
+        smb2_destroy_context(smb2);
+
+        if (pthread_create(&tc, NULL, par_create_thread, &c) != 0 ||
+            pthread_create(&td, NULL, par_delete_thread, &c) != 0 ||
+            pthread_create(&tl, NULL, par_list_thread, &c) != 0) {
+                c.stop = 1;
+                set_err(err, errlen, NULL, "pthread_create failed");
+                return -1;
+        }
+        usleep(2000000);
+        c.stop = 1;
+        pthread_join(tc, NULL);
+        pthread_join(td, NULL);
+        pthread_join(tl, NULL);
+
+        if (c.failed) {
+                snprintf(err, (size_t)errlen, "parallel op failed: %s", c.err);
+                goto out;
+        }
+        if (c.creates < 1 || c.deletes < 1 || c.lists < 1) {
+                snprintf(err, (size_t)errlen, "parallel too few ops creates=%d deletes=%d lists=%d",
+                         c.creates, c.deletes, c.lists);
+                goto out;
+        }
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (smb2) {
+                struct smb2dir *dir = smb2_opendir(smb2, "par");
+                if (dir) {
+                        struct smb2dirent *de;
+                        while ((de = smb2_readdir(smb2, dir)) != NULL) {
+                                char path[128];
+                                if (de->name[0] == '.') {
+                                        continue;
+                                }
+                                snprintf(path, sizeof(path), "par/%s", de->name);
+                                smb2_unlink(smb2, path);
+                        }
+                        smb2_closedir(smb2, dir);
+                }
+                smb2_rmdir(smb2, "par");
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        return rc;
+}
+
 #endif /* DEBUG */
