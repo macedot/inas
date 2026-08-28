@@ -907,35 +907,50 @@ int inas_smb_client_query_dir_wire(const char *host, uint16_t port, const char *
         req.name = "*";
         req.output_buffer_length = 0x10000;
 
-        memset(&w, 0, sizeof(w));
-        pdu = smb2_cmd_query_directory_async(smb2, &req, qdir_wire_cb, &w);
-        if (!pdu) {
-                set_err(err, errlen, smb2, "QUERY_DIRECTORY alloc failed");
-                smb2_close(smb2, fh);
-                goto out;
-        }
-        smb2_queue_pdu(smb2, pdu);
-        if (wait_for_cb(smb2, (struct raw_status *)&w) != 0) {
-                snprintf(err, (size_t)errlen, "QUERY_DIRECTORY timed out");
+        /* The second form is what smbclient's "ls" sends: a rooted pattern.
+         * The server must normalize it to the basename. */
+        const char *patterns[2] = {"*", "\\*"};
+        for (int pi = 0; pi < 2; pi++) {
+                req.name = patterns[pi];
+                memset(&w, 0, sizeof(w));
+                pdu = smb2_cmd_query_directory_async(smb2, &req, qdir_wire_cb, &w);
+                if (!pdu) {
+                        snprintf(err, (size_t)errlen, "QUERY_DIRECTORY alloc failed (%s)",
+                                 patterns[pi]);
+                        smb2_close(smb2, fh);
+                        goto out;
+                }
+                smb2_queue_pdu(smb2, pdu);
+                if (wait_for_cb(smb2, (struct raw_status *)&w) != 0) {
+                        snprintf(err, (size_t)errlen, "QUERY_DIRECTORY timed out (%s)",
+                                 patterns[pi]);
+                        free(w.buf);
+                        smb2_close(smb2, fh);
+                        goto out;
+                }
+                if (w.status != 0) {
+                        snprintf(err, (size_t)errlen, "QUERY_DIRECTORY (%s) status 0x%x",
+                                 patterns[pi], (unsigned)w.status);
+                        free(w.buf);
+                        smb2_close(smb2, fh);
+                        goto out;
+                }
+                if (!w.buf) {
+                        snprintf(err, (size_t)errlen, "QUERY_DIRECTORY (%s) missing output buffer",
+                                 patterns[pi]);
+                        smb2_close(smb2, fh);
+                        goto out;
+                }
+                rc = apple_parse_id_both(w.buf, w.len, err, errlen);
                 free(w.buf);
-                smb2_close(smb2, fh);
-                goto out;
+                if (rc != 0) {
+                        smb2_close(smb2, fh);
+                        goto out;
+                }
         }
         smb2_close(smb2, fh);
-        if (w.status != 0) {
-                snprintf(err, (size_t)errlen, "QUERY_DIRECTORY status 0x%x", (unsigned)w.status);
-                free(w.buf);
-                goto out;
-        }
-        if (!w.buf) {
-                snprintf(err, (size_t)errlen, "QUERY_DIRECTORY missing output buffer");
-                goto out;
-        }
-        rc = apple_parse_id_both(w.buf, w.len, err, errlen);
-        free(w.buf);
-        if (rc == 0) {
-                set_err(err, errlen, NULL, NULL);
-        }
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
 out:
         if (smb2) {
                 smb2_disconnect_share(smb2);

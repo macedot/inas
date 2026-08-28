@@ -2116,6 +2116,20 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
         }
 
         const char *pattern = req->name ? req->name : "*";
+        /* Clients send rooted patterns ("\*", "sub\*") while the search is
+         * relative to the handle's directory - smbclient's "ls" sends "\*"
+         * and would match nothing. Use the basename. */
+        const char *cut = strrchr(pattern, '\\');
+        const char *cut2 = strrchr(pattern, '/');
+        if (cut2 && (!cut || cut2 > cut)) {
+                cut = cut2;
+        }
+        if (cut) {
+                pattern = cut + 1;
+        }
+        if (!pattern[0]) {
+                pattern = "*";
+        }
         struct dirent *de;
         struct smb2_fileidbothdirectoryinformation *entries = NULL;
         size_t count = 0;
