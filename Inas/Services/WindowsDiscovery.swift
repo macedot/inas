@@ -22,6 +22,12 @@ final class WindowsDiscovery: WindowsDiscovering {
 
     private let queue = DispatchQueue(label: "app.inas.discovery")
     private var session: Session?
+    /// WiFi-flap resilience: discovery sockets bind the share-start IP; if
+    /// the interface address changes (DHCP renew, network drop), rebuild the
+    /// session so responders keep answering.
+    private var lastAdvertisedIP: String?
+    private var advertisedPort: UInt16 = 0
+    private var pathMonitor: NWPathMonitor?
 
     /// Per-peer token bucket for UDP Probe/Resolve and LLMNR replies.
     /// 5 tokens/s, burst of 3, at most 32 tracked addresses.
@@ -103,6 +109,9 @@ final class WindowsDiscovery: WindowsDiscovering {
     func start(ip: String, port: UInt16) {
         queue.async { [self] in
             stopLocked()
+            lastAdvertisedIP = ip
+            advertisedPort = port
+            startPathMonitor()
             let next = Session(ip: ip, port: port)
             session = next
             startMDNSHostname(next)
@@ -114,9 +123,69 @@ final class WindowsDiscovery: WindowsDiscovering {
         }
     }
 
+    private func startPathMonitor() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            self.queue.async { [weak self] in
+                guard let self, let currentIP = Self.primaryIPv4(on: path) else { return }
+                let port = self.advertisedPort
+                guard port != 0, currentIP != self.lastAdvertisedIP else {
+                    return
+                }
+                self.lastAdvertisedIP = currentIP
+                let next = Session(ip: currentIP, port: port)
+                self.stopLocked()
+                self.session = next
+                self.startMDNSHostname(next)
+                self.startWSD(next)
+                self.startLLMNR(next)
+                self.startMetadataHTTP(next)
+                self.sendHelloBurst(next)
+                self.startHelloTimer(next)
+            }
+        }
+        monitor.start(queue: queue)
+    }
+
+    /// Best-effort primary IPv4 of the current default path.
+    private static func primaryIPv4(on path: NWPath) -> String? {
+        guard path.status == .satisfied, let iface = path.availableInterfaces.first else {
+            return nil
+        }
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        var result: String?
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        while let curPtr = ptr {
+            let cur = curPtr.pointee
+            defer { ptr = cur.ifa_next }
+            guard let sa = cur.ifa_addr, let name0 = cur.ifa_name,
+                  String(cString: name0) == iface.name,
+                  sa.pointee.sa_family == UInt8(AF_INET) else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(sa, socklen_t(MemoryLayout<sockaddr_in>.size), &host,
+                           socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                let ip = String(cString: host)
+                if !ip.hasPrefix("169.254.") { // ignore self-assigned
+                    result = ip
+                    break
+                }
+            }
+        }
+        return result
+    }
+
     func stop() {
         queue.async { [self] in
             stopLocked()
+            pathMonitor?.cancel()
+            pathMonitor = nil
+            lastAdvertisedIP = nil
+            advertisedPort = 0
         }
     }
 

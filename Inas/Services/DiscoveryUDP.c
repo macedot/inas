@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -55,7 +56,18 @@ int inas_udp_open(const char *iface_ip, uint16_t local_port, const char *mcast_g
                 memset(&mreq, 0, sizeof(mreq));
                 if (inet_pton(AF_INET, mcast_group, &mreq.imr_multiaddr) == 1) {
                         mreq.imr_interface = iface;
-                        (void)setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+                        if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq,
+                                       sizeof(mreq)) != 0) {
+                                int err = errno;
+                                /* iOS drops multicast without the
+                                 * com.apple.developer.networking.multicast
+                                 * entitlement - surface it instead of
+                                 * leaving the responder deaf. */
+                                fprintf(stderr, "inas-udp: join %s failed: %s\n", mcast_group,
+                                        strerror(err));
+                                close(fd);
+                                return -err;
+                        }
                 }
         }
 
