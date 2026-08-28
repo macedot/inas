@@ -1682,6 +1682,23 @@ out:
         return rc;
 }
 
+struct xfer_samp {
+        volatile int stop;
+        volatile int seen;
+};
+
+static void *xfer_samp_thread(void *arg)
+{
+        struct xfer_samp *s = arg;
+        while (!s->stop) {
+                if (inas_smb_active_transfers() > 0) {
+                        s->seen = 1;
+                }
+                usleep(200);
+        }
+        return NULL;
+}
+
 int inas_smb_client_transfer_verify(const char *host, uint16_t port, const char *user,
                                     const char *password, const char *share, char *err, int errlen)
 {
@@ -1691,12 +1708,18 @@ int inas_smb_client_transfer_verify(const char *host, uint16_t port, const char 
         uint8_t *rbuf = NULL;
         const uint32_t chunk = 512 * 1024;
         const int chunks = 4;
+        struct xfer_samp samp = {0, 0};
+        pthread_t th;
+        int samp_started = 0;
         int i;
         int rc = -1;
 
         smb2 = open_share(host, port, user, password, share, 0, err, errlen);
         if (!smb2) {
                 return -1;
+        }
+        if (pthread_create(&th, NULL, xfer_samp_thread, &samp) == 0) {
+                samp_started = 1;
         }
         wbuf = malloc(chunk);
         rbuf = malloc(chunk);
@@ -1734,9 +1757,22 @@ int inas_smb_client_transfer_verify(const char *host, uint16_t port, const char 
                 }
         }
         smb2_close(smb2, fh);
+        samp.stop = 1;
+        if (samp_started) {
+                pthread_join(th, NULL);
+                samp_started = 0;
+        }
+        if (!samp.seen) {
+                set_err(err, errlen, NULL, "active_transfers stayed 0 during 2MB write/read");
+                goto out;
+        }
         set_err(err, errlen, NULL, NULL);
         rc = 0;
 out:
+        samp.stop = 1;
+        if (samp_started) {
+                pthread_join(th, NULL);
+        }
         if (smb2) {
                 smb2_unlink(smb2, "xfer-verify.bin");
                 smb2_disconnect_share(smb2);
@@ -1744,6 +1780,74 @@ out:
         }
         free(wbuf);
         free(rbuf);
+        return rc;
+}
+
+static int wait_count(int want, int tries)
+{
+        int i;
+        for (i = 0; i < tries; i++) {
+                if (inas_smb_client_count() == want) {
+                        return 0;
+                }
+                usleep(20000);
+        }
+        return -1;
+}
+
+int inas_smb_client_two_sessions_count(const char *host, uint16_t port, const char *user,
+                                       const char *password, const char *share, char *err,
+                                       int errlen)
+{
+        struct smb2_context *a = NULL;
+        struct smb2_context *b = NULL;
+        int rc = -1;
+
+        a = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!a) {
+                return -1;
+        }
+        if (wait_count(1, 50) != 0) {
+                snprintf(err, (size_t)errlen, "count after first session is %d",
+                         inas_smb_client_count());
+                goto out;
+        }
+        b = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!b) {
+                goto out;
+        }
+        if (wait_count(2, 50) != 0) {
+                snprintf(err, (size_t)errlen, "count after second session is %d",
+                         inas_smb_client_count());
+                goto out;
+        }
+        smb2_disconnect_share(a);
+        smb2_destroy_context(a);
+        a = NULL;
+        if (wait_count(1, 50) != 0) {
+                snprintf(err, (size_t)errlen, "count after drop first is %d",
+                         inas_smb_client_count());
+                goto out;
+        }
+        smb2_disconnect_share(b);
+        smb2_destroy_context(b);
+        b = NULL;
+        if (wait_count(0, 50) != 0) {
+                snprintf(err, (size_t)errlen, "count after drop second is %d",
+                         inas_smb_client_count());
+                goto out;
+        }
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        if (a) {
+                smb2_disconnect_share(a);
+                smb2_destroy_context(a);
+        }
+        if (b) {
+                smb2_disconnect_share(b);
+                smb2_destroy_context(b);
+        }
         return rc;
 }
 

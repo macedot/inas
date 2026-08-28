@@ -243,14 +243,15 @@ static struct inas_io_completion *io_pending_dequeue(struct inas_state *fs)
 /* Start one op on a worker. Caller already owns a gate slot. */
 static void io_op_start(struct inas_state *fs, struct inas_io_completion *op)
 {
-        atomic_fetch_add(&fs->active_transfers, 1);
         dispatch_async_f(fs->io_worker_queue, op, io_worker);
 }
 
 /* Server thread. Never blocks: if the worker gate is full the op sits
- * on io_pending until io_kick() runs from extra_service. */
+ * on io_pending until io_kick() runs from extra_service. Counted from
+ * accept until io_op_finish queues the reply. */
 static void io_op_dispatch(struct inas_state *fs, struct inas_io_completion *op)
 {
+        atomic_fetch_add(&fs->active_transfers, 1);
         if (dispatch_semaphore_wait(fs->io_worker_gate, DISPATCH_TIME_NOW) == 0) {
                 io_op_start(fs, op);
                 return;
@@ -296,7 +297,6 @@ static void io_worker(void *ctx)
         }
         close(op->fd);
         op->fd = -1;
-        atomic_fetch_sub(&fs->active_transfers, 1);
 
         pthread_mutex_lock(&fs->io_lock);
         op->next = NULL;
@@ -419,6 +419,7 @@ static void io_op_finish(struct inas_state *fs, struct inas_io_completion *op)
         io_target_release(fs, op->target);
         free(op->buf);
         free(op);
+        atomic_fetch_sub(&fs->active_transfers, 1);
 }
 
 /* Server-thread only (extra_service): drain finished ops. */
@@ -455,6 +456,7 @@ static void io_teardown(struct inas_state *fs)
                 io_target_release(fs, op->target);
                 free(op->buf);
                 free(op);
+                atomic_fetch_sub(&fs->active_transfers, 1);
                 op = next;
         }
         while (pending) {
@@ -465,6 +467,7 @@ static void io_teardown(struct inas_state *fs)
                 io_target_release(fs, pending->target);
                 free(pending->buf);
                 free(pending);
+                atomic_fetch_sub(&fs->active_transfers, 1);
                 pending = next;
         }
         for (int i = 0; i < INAS_IO_TARGETS; i++) {
@@ -889,18 +892,20 @@ static int session_established(struct smb2_server *srvr, struct smb2_context *sm
         inas_auth_on_success(inas_auth_lookup(fs->auth, INAS_AUTH_PEERS, peer_ipv4(smb2), now));
         inas_auth_global_record_success(&fs->auth_global);
         if (session_slot(fs, smb2) < 0) {
+                int placed = 0;
                 for (int i = 0; i < INAS_MAX_SESSIONS; i++) {
                         if (fs->sessions[i] == NULL) {
                                 fs->sessions[i] = smb2;
-                                int n = atomic_fetch_add(&fs->clients, 1) + 1;
-                                uint64_t peak = atomic_load(&fs->peak_clients);
-                                while ((uint64_t)n > peak &&
-                                       !atomic_compare_exchange_weak(&fs->peak_clients, &peak,
-                                                                     (uint64_t)n)) {
-                                }
+                                placed = 1;
                                 break;
                         }
                 }
+                int n = atomic_fetch_add(&fs->clients, 1) + 1;
+                uint64_t peak = atomic_load(&fs->peak_clients);
+                while ((uint64_t)n > peak &&
+                       !atomic_compare_exchange_weak(&fs->peak_clients, &peak, (uint64_t)n)) {
+                }
+                (void)placed;
         }
         pthread_mutex_unlock(&fs->lock);
         return 0;
@@ -925,8 +930,8 @@ static int destruction_event(struct smb2_server *srvr, struct smb2_context *smb2
         int slot = session_slot(fs, smb2);
         if (slot >= 0) {
                 fs->sessions[slot] = NULL;
-                int n = atomic_fetch_sub(&fs->clients, 1);
-                if (n <= 1) {
+                int prev = atomic_fetch_sub(&fs->clients, 1);
+                if (prev <= 0) {
                         atomic_store(&fs->clients, 0);
                 }
         }

@@ -316,30 +316,35 @@ final class ShareController {
         #endif
         lastStatsTotal = 0
         statsTimer?.invalidate()
-        statsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                if !simNoWatchdog, let expected = self.endpoint?.ip, self.lan.lanIPv4() != expected {
-                    self.stop(notify: true)
-                    return
-                }
-                self.clientCount = self.server.clientCount
-                self.bytesTransferred = self.server.bytesTransferred
-                let total = self.bytesTransferred
-                // A smaller total than the previous tick means the server
-                // restarted underneath us; report no rate for that tick.
-                let delta = total >= self.lastStatsTotal ? total - self.lastStatsTotal : 0
-                self.lastStatsTotal = total
-                self.stats = ShareStats(
-                    connections: self.clientCount,
-                    peakClients: self.server.peakClients,
-                    activeTransfers: self.server.activeTransfers,
-                    bytesRead: self.server.bytesRead,
-                    bytesWritten: self.server.bytesWritten,
-                    bytesPerSecond: Double(delta)
-                )
+        let tick: () -> Void = { [weak self] in
+            guard let self else { return }
+            if !simNoWatchdog, let expected = self.endpoint?.ip, self.lan.lanIPv4() != expected {
+                self.stop(notify: true)
+                return
             }
+            self.clientCount = self.server.clientCount
+            self.bytesTransferred = self.server.bytesTransferred
+            let total = self.bytesTransferred
+            // A smaller total than the previous tick means the server
+            // restarted underneath us; report no rate for that tick.
+            let delta = total >= self.lastStatsTotal ? total - self.lastStatsTotal : 0
+            self.lastStatsTotal = total
+            // 0.25s window: scale to bytes/s for the Speed row.
+            self.stats = ShareStats(
+                connections: self.clientCount,
+                peakClients: self.server.peakClients,
+                activeTransfers: self.server.activeTransfers,
+                bytesRead: self.server.bytesRead,
+                bytesWritten: self.server.bytesWritten,
+                bytesPerSecond: Double(delta) * 4
+            )
         }
+        tick()
+        let timer = Timer(timeInterval: 0.25, repeats: true) { _ in
+            Task { @MainActor in tick() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        statsTimer = timer
     }
 
     private func registerBackgroundTask() {

@@ -4,7 +4,7 @@
 import Foundation
 
 /// Aggregated, anonymous activity counters for the running share.
-/// Filled from the SMB server's atomic counters once per second.
+/// Filled from the SMB server's atomic counters several times per second.
 struct ShareStats: Equatable {
     var connections: Int = 0
     var peakClients: Int = 0

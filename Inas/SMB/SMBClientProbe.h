@@ -115,6 +115,11 @@ int inas_smb_client_parallel_create_delete_list(const char *host, uint16_t port,
 int inas_smb_client_flush_is_fast(const char *host, uint16_t port, const char *user,
                                   const char *password, const char *share, char *err, int errlen);
 
+/* Two live sessions: count==2, drop one => 1, drop the other => 0. */
+int inas_smb_client_two_sessions_count(const char *host, uint16_t port, const char *user,
+                                       const char *password, const char *share, char *err,
+                                       int errlen);
+
 #endif /* DEBUG */
 
 #ifdef __cplusplus
