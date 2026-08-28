@@ -2096,10 +2096,15 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 }
         }
         if (h->enum_done) {
-                pthread_mutex_unlock(&fs->lock);
-                rep->output_buffer = NULL;
-                rep->output_buffer_length = 0;
-                return 0;
+                /* The previous enumeration reached its end. A new
+                 * QUERY_DIRECTORY on the same handle is a fresh search -
+                 * smbclient reuses its CWD handle across "ls" commands and
+                 * surfaces an empty restart-less result as NO_SUCH_FILE. */
+                h->enum_done = 0;
+                h->enum_index = 0;
+                if (h->dir) {
+                        rewinddir(h->dir);
+                }
         }
         if (!h->dir) {
                 int dfd = h->fd >= 0 ? dup(h->fd) : dup(h->dirfd);
