@@ -97,6 +97,9 @@ struct inas_handle {
         char leaf[256];
         int is_dir;
         int delete_on_close;
+        int unlinked; /* name already removed (SET_INFO disposition) */
+        int notify_pending;
+        uint64_t notify_mid;
         uint32_t enum_index;
         int enum_done;
         uint32_t access;
@@ -267,6 +270,10 @@ static int inas_status_from_errno(int err)
                 return SMB2_STATUS_FILE_CLOSED;
         case ENOMEM:
                 return SMB2_STATUS_INSUFFICIENT_RESOURCES;
+        case ENOTEMPTY:
+                return SMB2_STATUS_DIRECTORY_NOT_EMPTY;
+        case EEXIST:
+                return SMB2_STATUS_OBJECT_NAME_COLLISION;
         default:
                 return SMB2_STATUS_NOT_SUPPORTED;
         }
@@ -411,6 +418,72 @@ static struct inas_handle *handle_lookup(struct inas_state *fs, const smb2_file_
         return NULL;
 }
 
+static void notify_send(struct smb2_context *smb2, uint64_t message_id, uint32_t status)
+{
+        struct smb2_error_reply err;
+        struct smb2_pdu *pdu;
+
+        if (!smb2) {
+                return;
+        }
+        memset(&err, 0, sizeof(err));
+        pdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_CHANGE_NOTIFY, (int)status, NULL, NULL);
+        if (!pdu) {
+                return;
+        }
+        smb2_set_pdu_message_id(smb2, pdu, message_id);
+        smb2_queue_pdu(smb2, pdu);
+}
+
+/* Complete every outstanding CHANGE_NOTIFY. Finder watches displayed
+ * folders; STATUS_NOTIFY_ENUM_DIR tells it to re-list. Called after
+ * create/unlink/rename — never after a plain WRITE (.DS_Store). */
+static void notify_complete_all(struct inas_state *fs, uint32_t status)
+{
+        for (int i = 0; i < INAS_MAX_HANDLES; i++) {
+                struct inas_handle *h = &fs->handles[i];
+                if (!h->in_use || !h->notify_pending) {
+                        continue;
+                }
+                notify_send(h->owner, h->notify_mid, status);
+                h->notify_pending = 0;
+                h->notify_mid = 0;
+        }
+}
+
+/* True if `fd` is a directory containing only "." / "..". 1 empty, 0 not,
+ * <0 -errno. Uses a private DIR* so QUERY_DIRECTORY cursor is untouched. */
+static int dir_is_empty_fd(int fd)
+{
+        int dfd;
+        DIR *d;
+        struct dirent *de;
+
+        if (fd < 0) {
+                return -EBADF;
+        }
+        dfd = dup(fd);
+        if (dfd < 0) {
+                return -errno;
+        }
+        d = fdopendir(dfd);
+        if (!d) {
+                int err = errno;
+                close(dfd);
+                return -err;
+        }
+        while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.' &&
+                    (de->d_name[1] == '\0' || (de->d_name[1] == '.' && de->d_name[2] == '\0'))) {
+                        continue;
+                }
+                closedir(d);
+                return 0;
+        }
+        closedir(d);
+        return 1;
+}
+
 static struct inas_handle *handle_alloc(struct inas_state *fs, struct smb2_context *owner)
 {
         for (int i = 0; i < INAS_MAX_HANDLES; i++) {
@@ -428,10 +501,19 @@ static struct inas_handle *handle_alloc(struct inas_state *fs, struct smb2_conte
         return NULL;
 }
 
-static void handle_free(struct inas_handle *h)
+static int handle_free(struct inas_state *fs, struct inas_handle *h, int send_notify)
 {
+        int rc = 0;
+
         if (!h || !h->in_use) {
-                return;
+                return 0;
+        }
+        if (h->notify_pending) {
+                if (send_notify) {
+                        notify_send(h->owner, h->notify_mid, SMB2_STATUS_NOTIFY_CLEANUP);
+                }
+                h->notify_pending = 0;
+                h->notify_mid = 0;
         }
         /* closedir() releases only the dup()ed fd that fdopendir() owns;
          * h->fd and h->dirfd are separate descriptors closed below. */
@@ -443,8 +525,14 @@ static void handle_free(struct inas_handle *h)
                 close(h->fd);
                 h->fd = -1;
         }
-        if (h->delete_on_close && h->dirfd >= 0 && h->leaf[0]) {
-                unlinkat(h->dirfd, h->leaf, h->is_dir ? AT_REMOVEDIR : 0);
+        if (h->delete_on_close && !h->unlinked && h->dirfd >= 0 && h->leaf[0]) {
+                if (unlinkat(h->dirfd, h->leaf, h->is_dir ? AT_REMOVEDIR : 0) != 0) {
+                        if (errno != ENOENT) {
+                                rc = -errno;
+                        }
+                } else if (send_notify) {
+                        notify_complete_all(fs, SMB2_STATUS_NOTIFY_ENUM_DIR);
+                }
         }
         if (h->dirfd >= 0) {
                 close(h->dirfd);
@@ -453,16 +541,18 @@ static void handle_free(struct inas_handle *h)
         memset(h, 0, sizeof(*h));
         h->fd = -1;
         h->dirfd = -1;
+        return rc;
 }
 
 /* Release every handle opened by `owner` (connection teardown or LOGOFF).
- * Returns the number of handles freed. */
+ * Returns the number of handles freed. Pending notifies are dropped:
+ * the connection is going away, so there is nowhere to send CLEANUP. */
 static int handle_free_owned(struct inas_state *fs, struct smb2_context *owner)
 {
         int freed = 0;
         for (int i = 0; i < INAS_MAX_HANDLES; i++) {
                 if (fs->handles[i].in_use && fs->handles[i].owner == owner) {
-                        handle_free(&fs->handles[i]);
+                        handle_free(fs, &fs->handles[i], 0);
                         freed++;
                 }
         }
@@ -987,7 +1077,7 @@ static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         memset(&st, 0, sizeof(st));
         int err = open_path(h, rootfd, open_name, req, &st);
         if (err != 0) {
-                handle_free(h);
+                handle_free(fs, h, 0);
                 pthread_mutex_unlock(&fs->lock);
                 return err;
         }
@@ -1006,6 +1096,9 @@ static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         rep->change_time = timespec_to_smb(&st.st_ctimespec);
         rep->create_action = h->create_action ? h->create_action : 1;
         rep->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
+        if (h->create_action == 2) {
+                notify_complete_all(fs, SMB2_STATUS_NOTIFY_ENUM_DIR);
+        }
         pthread_mutex_unlock(&fs->lock);
         return 0;
 }
@@ -1033,9 +1126,9 @@ static int close_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         memset(rep, 0, sizeof(*rep));
         rep->file_attributes = stat_to_attrs(&st);
         rep->end_of_file = (uint64_t)st.st_size;
-        handle_free(h);
+        int rc = handle_free(fs, h, 1);
         pthread_mutex_unlock(&fs->lock);
-        return 0;
+        return rc;
 }
 
 static int flush_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
@@ -1442,7 +1535,8 @@ static int fill_basic(const struct stat *st, struct smb2_file_basic_info *info)
         return (int)sizeof(*info);
 }
 
-static int fill_standard(const struct stat *st, struct smb2_file_standard_info *info)
+static int fill_standard(const struct stat *st, struct smb2_file_standard_info *info,
+                         int delete_pending)
 {
         memset(info, 0, sizeof(*info));
         info->directory = S_ISDIR(st->st_mode) ? 1 : 0;
@@ -1453,7 +1547,8 @@ static int fill_standard(const struct stat *st, struct smb2_file_standard_info *
                 info->allocation_size = (uint64_t)st->st_blocks * 512ull;
                 info->end_of_file = (uint64_t)st->st_size;
         }
-        info->number_of_links = (uint32_t)st->st_nlink;
+        info->delete_pending = delete_pending ? 1 : 0;
+        info->number_of_links = delete_pending ? 0 : (uint32_t)st->st_nlink;
         return (int)sizeof(*info);
 }
 
@@ -1466,10 +1561,12 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         pthread_mutex_lock(&fs->lock);
         struct inas_handle *h = handle_lookup(fs, req->file_id);
         struct stat st;
+        int delete_pending = 0;
         memset(&st, 0, sizeof(st));
         const char *root = share_root_for_tree(fs, smb2);
         int rootfd = share_rootfd_for_tree(fs, smb2);
         if (h) {
+                delete_pending = h->delete_on_close;
                 if (h->fd >= 0) {
                         fstat(h->fd, &st);
                 } else if (h->leaf[0] && h->dirfd >= 0) {
@@ -1510,7 +1607,7 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         struct smb2_file_standard_info *p = calloc(1, sizeof(*p));
                         if (!p)
                                 return -1;
-                        len = fill_standard(&st, p);
+                        len = fill_standard(&st, p, delete_pending);
                         info = p;
                         break;
                 }
@@ -1550,7 +1647,7 @@ static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         if (!p)
                                 return -1;
                         fill_basic(&st, &p->basic);
-                        fill_standard(&st, &p->standard);
+                        fill_standard(&st, &p->standard, delete_pending);
                         p->index_number = inas_file_id(&st);
                         p->access_flags = 0x001f01ff;
                         char *stored = (char *)(p + 1);
@@ -1776,15 +1873,56 @@ static int set_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         struct inas_handle *h = handle_lookup(fs, req->file_id);
         if (!h) {
                 pthread_mutex_unlock(&fs->lock);
-                return -1;
+                return -EBADF;
         }
         int rc = 0;
         if (req->info_type == SMB2_0_INFO_FILE) {
                 switch (req->file_info_class) {
                 case SMB2_FILE_DISPOSITION_INFORMATION: {
                         struct smb2_file_disposition_info *info = req->input_data;
-                        if (info) {
-                                h->delete_on_close = info->delete_pending ? 1 : 0;
+                        int is_dir, dirfd, fd;
+                        char leaf[256];
+
+                        if (!info) {
+                                break;
+                        }
+                        if (!info->delete_pending) {
+                                /* Cannot undelete a name already unlinked. */
+                                if (!h->unlinked) {
+                                        h->delete_on_close = 0;
+                                }
+                                break;
+                        }
+                        if (!h->leaf[0] || h->dirfd < 0) {
+                                rc = -EPERM;
+                                break;
+                        }
+                        is_dir = h->is_dir;
+                        dirfd = h->dirfd;
+                        fd = h->fd;
+                        snprintf(leaf, sizeof(leaf), "%s", h->leaf);
+                        pthread_mutex_unlock(&fs->lock);
+
+                        if (is_dir) {
+                                int empty = dir_is_empty_fd(fd);
+                                if (empty == 0) {
+                                        return -ENOTEMPTY;
+                                }
+                                if (empty < 0) {
+                                        return empty;
+                                }
+                        }
+                        if (unlinkat(dirfd, leaf, is_dir ? AT_REMOVEDIR : 0) != 0 &&
+                            errno != ENOENT) {
+                                return -errno;
+                        }
+
+                        pthread_mutex_lock(&fs->lock);
+                        h = handle_lookup(fs, req->file_id);
+                        if (h) {
+                                h->delete_on_close = 1;
+                                h->unlinked = 1;
+                                notify_complete_all(fs, SMB2_STATUS_NOTIFY_ENUM_DIR);
                         }
                         break;
                 }
@@ -1792,7 +1930,7 @@ static int set_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         struct smb2_file_end_of_file_info *info = req->input_data;
                         if (info && h->fd >= 0) {
                                 if (ftruncate(h->fd, (off_t)info->end_of_file) != 0) {
-                                        rc = -1;
+                                        rc = -errno;
                                 }
                         }
                         break;
@@ -1803,17 +1941,17 @@ static int set_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         int rootfd = share_rootfd_for_tree(fs, smb2);
                         if (!info || !info->file_name || rootfd < 0 || h->dirfd < 0 ||
                             !h->leaf[0]) {
-                                rc = -1;
+                                rc = -EINVAL;
                                 break;
                         }
                         if (inas_path_resolve_at(rootfd, (const char *)info->file_name, &dest) !=
                             0) {
-                                rc = -1;
+                                rc = -ENOENT;
                                 break;
                         }
                         if (!dest.name[0]) {
                                 inas_path_release(&dest);
-                                rc = -1;
+                                rc = -EINVAL;
                                 break;
                         }
                         if (!info->replace_if_exist) {
@@ -1821,13 +1959,13 @@ static int set_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                                 if (fstatat(dest.dirfd, dest.name, &exists, AT_SYMLINK_NOFOLLOW) ==
                                     0) {
                                         inas_path_release(&dest);
-                                        rc = -1;
+                                        rc = -EEXIST;
                                         break;
                                 }
                         }
                         if (renameat(h->dirfd, h->leaf, dest.dirfd, dest.name) != 0) {
+                                rc = -errno;
                                 inas_path_release(&dest);
-                                rc = -1;
                                 break;
                         }
                         close(h->dirfd);
@@ -1835,6 +1973,7 @@ static int set_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         dest.dirfd = -1;
                         snprintf(h->leaf, sizeof(h->leaf), "%s", dest.name);
                         inas_path_release(&dest);
+                        notify_complete_all(fs, SMB2_STATUS_NOTIFY_ENUM_DIR);
                         break;
                 }
                 case SMB2_FILE_BASIC_INFORMATION:
@@ -1895,16 +2034,31 @@ static int change_notify_cmd(struct smb2_server *srvr, struct smb2_context *smb2
                              struct smb2_change_notify_reply *rep)
 {
         struct inas_state *fs = fs_state(srvr);
-        (void)smb2;
-        (void)req;
-        (void)fs;
+        struct inas_handle *h;
+        uint64_t mid;
+
         memset(rep, 0, sizeof(*rep));
-        /* We cannot hold notifications pending. Completing immediately —
-         * with SUCCESS or with NOTIFY_ENUM_DIR — makes clients (macOS smbfs
-         * watches every folder it displays) re-arm in a tight loop until
-         * they tear the share down. STATUS_NOT_SUPPORTED tells the client
-         * to fall back to polling, which is stable. */
-        return -ENOSYS;
+        pthread_mutex_lock(&fs->lock);
+        h = handle_lookup(fs, req->file_id);
+        if (!h) {
+                pthread_mutex_unlock(&fs->lock);
+                return -EBADF;
+        }
+        /* One outstanding notify per handle. A second arm replaces the
+         * first with ENUM_DIR so Finder re-lists rather than hanging. */
+        if (h->notify_pending) {
+                notify_send(h->owner, h->notify_mid, SMB2_STATUS_NOTIFY_ENUM_DIR);
+                h->notify_pending = 0;
+                h->notify_mid = 0;
+        }
+        mid = smb2_get_last_request_message_id(smb2);
+        h->notify_pending = 1;
+        h->notify_mid = mid;
+        pthread_mutex_unlock(&fs->lock);
+        /* No PDU now — same deferred pattern as READ/WRITE. Finder's
+         * poll fallback was the multi-second spinner; we complete this
+         * on the next create/unlink/rename (or CLOSE/CANCEL). */
+        return 1;
 }
 
 static int lock_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
@@ -1926,7 +2080,20 @@ static int echo_cmd(struct smb2_server *srvr, struct smb2_context *smb2)
 static int cancel_cmd(struct smb2_server *srvr, struct smb2_context *smb2)
 {
         struct inas_state *fs = fs_state(srvr);
-        (void)smb2;
+        uint64_t mid = smb2_get_last_request_message_id(smb2);
+
+        pthread_mutex_lock(&fs->lock);
+        for (int i = 0; i < INAS_MAX_HANDLES; i++) {
+                struct inas_handle *h = &fs->handles[i];
+                if (h->in_use && h->notify_pending && h->owner == smb2 && h->notify_mid == mid) {
+                        notify_send(h->owner, h->notify_mid, SMB2_STATUS_CANCELLED);
+                        h->notify_pending = 0;
+                        h->notify_mid = 0;
+                        break;
+                }
+        }
+        pthread_mutex_unlock(&fs->lock);
+        /* SMB2 CANCEL itself has no response; the cancelled command does. */
         return 0;
 }
 
@@ -2081,7 +2248,7 @@ int inas_smb_start(const inas_smb_config *config)
         memset(&g.server, 0, sizeof(g.server));
         g.server.fd = -1;
         for (int i = 0; i < INAS_MAX_HANDLES; i++) {
-                handle_free(&g.handles[i]);
+                handle_free(&g, &g.handles[i], 0);
         }
         io_teardown(&g);
         if (g.wake[0] < 0) {
@@ -2259,7 +2426,7 @@ void inas_smb_stop(void)
         }
         pthread_mutex_lock(&g.lock);
         for (int i = 0; i < INAS_MAX_HANDLES; i++) {
-                handle_free(&g.handles[i]);
+                handle_free(&g, &g.handles[i], 0);
         }
         close_share_fds();
         g.share_count = 0;

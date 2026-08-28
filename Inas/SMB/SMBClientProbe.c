@@ -539,12 +539,36 @@ int inas_smb_client_linux_post_login(const char *host, uint16_t port, const char
         memcpy(cn.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
         cn.completion_filter = SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_FILE_NAME |
                                SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_DIR_NAME;
-        if (run_until_status(smb2, smb2_cmd_change_notify_async(smb2, &cn, raw_cb, &rs), &rs,
-                             "CHANGE_NOTIFY", err, errlen) != 0) {
-                smb2_close(smb2, fh);
-                goto out;
+        {
+                struct smb2_pdu *pdu = smb2_cmd_change_notify_async(smb2, &cn, raw_cb, &rs);
+                struct smb2fh *touch;
+
+                if (!pdu) {
+                        set_err(err, errlen, smb2, "CHANGE_NOTIFY alloc failed");
+                        smb2_close(smb2, fh);
+                        goto out;
+                }
+                memset(&rs, 0, sizeof(rs));
+                smb2_queue_pdu(smb2, pdu);
+                /* Notify is held until a name change; create a file so this
+                 * probe does not sit on the 5s poll timeout. */
+                touch = smb2_open(smb2, "cn-touch.txt", O_RDWR | O_CREAT);
+                if (touch) {
+                        smb2_close(smb2, touch);
+                }
+                if (wait_for_cb(smb2, &rs) != 0) {
+                        snprintf(err, (size_t)errlen, "CHANGE_NOTIFY timed out");
+                        smb2_close(smb2, fh);
+                        goto out;
+                }
+                if (rs.status == (int)SMB2_STATUS_NOT_IMPLEMENTED) {
+                        snprintf(err, (size_t)errlen, "CHANGE_NOTIFY: STATUS_NOT_IMPLEMENTED");
+                        smb2_close(smb2, fh);
+                        goto out;
+                }
         }
         smb2_close(smb2, fh);
+        smb2_unlink(smb2, "cn-touch.txt");
 
         set_err(err, errlen, NULL, NULL);
         rc = 0;
@@ -1214,6 +1238,266 @@ out:
         if (smb2) {
                 smb2_unlink(smb2, "qdir-dir/entry.txt");
                 smb2_rmdir(smb2, "qdir-dir");
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        return rc;
+}
+
+static int wait_for_cb_timeout(struct smb2_context *smb2, struct raw_status *rs, int timeout_ms)
+{
+        int left = timeout_ms;
+
+        while (!rs->done && left > 0) {
+                struct pollfd pfd;
+                int slice = left > 100 ? 100 : left;
+                int pr;
+
+                pfd.fd = smb2_get_fd(smb2);
+                pfd.events = (short)smb2_which_events(smb2);
+                pfd.revents = 0;
+                pr = poll(&pfd, 1, slice);
+                if (pr < 0) {
+                        return -1;
+                }
+                left -= slice;
+                if (pr == 0) {
+                        continue;
+                }
+                if (smb2_service(smb2, pfd.revents) < 0) {
+                        return -1;
+                }
+        }
+        return rs->done ? 0 : -1;
+}
+
+/* Finder delete/rename edges: name gone after SET_INFO (before CLOSE),
+ * non-empty directory disposition, rename collision. */
+int inas_smb_client_setinfo_delete_edges(const char *host, uint16_t port, const char *user,
+                                         const char *password, const char *share, char *err,
+                                         int errlen)
+{
+        struct smb2_context *smb2;
+        struct smb2fh *fh;
+        struct smb2fh *fh2;
+        struct smb2_set_info_request sr;
+        struct smb2_file_disposition_info fdi;
+        struct smb2_file_rename_info rni;
+        struct raw_status rs;
+        int rc = -1;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+
+        fh = smb2_open(smb2, "si-gone.txt", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create si-gone.txt failed");
+                goto out;
+        }
+        memset(&sr, 0, sizeof(sr));
+        sr.info_type = SMB2_0_INFO_FILE;
+        sr.file_info_class = SMB2_FILE_DISPOSITION_INFORMATION;
+        memcpy(sr.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        fdi.delete_pending = 1;
+        sr.input_data = &fdi;
+        if (run_until_status(smb2, smb2_cmd_set_info_async(smb2, &sr, raw_cb, &rs), &rs,
+                             "FileDispositionInformation gone", err, errlen) != 0) {
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        if (rs.status != 0) {
+                snprintf(err, (size_t)errlen, "disposition si-gone.txt status 0x%x",
+                         (unsigned)rs.status);
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        fh2 = smb2_open(smb2, "si-gone.txt", O_RDONLY);
+        if (fh2) {
+                smb2_close(smb2, fh2);
+                smb2_close(smb2, fh);
+                set_err(err, errlen, NULL, "si-gone.txt still resolvable after SET_INFO");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+
+        if (smb2_mkdir(smb2, "si-ned") != 0) {
+                set_err(err, errlen, smb2, "mkdir si-ned failed");
+                goto out;
+        }
+        fh = smb2_open(smb2, "si-ned/child.txt", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create si-ned/child.txt failed");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        fh = smb2_open(smb2, "si-ned", O_RDONLY);
+        if (!fh) {
+                set_err(err, errlen, smb2, "open si-ned failed");
+                goto out;
+        }
+        memset(&sr, 0, sizeof(sr));
+        sr.info_type = SMB2_0_INFO_FILE;
+        sr.file_info_class = SMB2_FILE_DISPOSITION_INFORMATION;
+        memcpy(sr.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        fdi.delete_pending = 1;
+        sr.input_data = &fdi;
+        if (run_until_status(smb2, smb2_cmd_set_info_async(smb2, &sr, raw_cb, &rs), &rs,
+                             "FileDispositionInformation ned", err, errlen) != 0) {
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        if (rs.status != (int)SMB2_STATUS_DIRECTORY_NOT_EMPTY) {
+                snprintf(err, (size_t)errlen, "non-empty dir disposition status 0x%x",
+                         (unsigned)rs.status);
+                goto out;
+        }
+
+        fh = smb2_open(smb2, "si-col-a.txt", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create si-col-a.txt failed");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        fh = smb2_open(smb2, "si-col-b.txt", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create si-col-b.txt failed");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        fh = smb2_open(smb2, "si-col-a.txt", O_RDWR);
+        if (!fh) {
+                set_err(err, errlen, smb2, "reopen si-col-a.txt failed");
+                goto out;
+        }
+        memset(&sr, 0, sizeof(sr));
+        sr.info_type = SMB2_0_INFO_FILE;
+        sr.file_info_class = SMB2_FILE_RENAME_INFORMATION;
+        memcpy(sr.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+        rni.replace_if_exist = 0;
+        rni.file_name = (const uint8_t *)"si-col-b.txt";
+        sr.input_data = &rni;
+        if (run_until_status(smb2, smb2_cmd_set_info_async(smb2, &sr, raw_cb, &rs), &rs,
+                             "FileRenameInformation collision", err, errlen) != 0) {
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        smb2_close(smb2, fh);
+        if (rs.status != (int)SMB2_STATUS_OBJECT_NAME_COLLISION) {
+                snprintf(err, (size_t)errlen, "rename collision status 0x%x", (unsigned)rs.status);
+                goto out;
+        }
+
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        if (smb2) {
+                smb2_unlink(smb2, "si-gone.txt");
+                smb2_unlink(smb2, "si-ned/child.txt");
+                smb2_rmdir(smb2, "si-ned");
+                smb2_unlink(smb2, "si-col-a.txt");
+                smb2_unlink(smb2, "si-col-b.txt");
+                smb2_disconnect_share(smb2);
+                smb2_destroy_context(smb2);
+        }
+        return rc;
+}
+
+/* CHANGE_NOTIFY must stay pending across a WRITE and complete with
+ * NOTIFY_ENUM_DIR when a name is created. */
+int inas_smb_client_change_notify_mutate(const char *host, uint16_t port, const char *user,
+                                         const char *password, const char *share, char *err,
+                                         int errlen)
+{
+        struct smb2_context *smb2;
+        struct smb2fh *root = NULL;
+        struct smb2fh *fh;
+        struct smb2_change_notify_request cn;
+        struct smb2_pdu *pdu;
+        struct raw_status rs;
+        char buf[4] = {'x', 'x', 'x', 'x'};
+        int rc = -1;
+
+        smb2 = open_share(host, port, user, password, share, 0, err, errlen);
+        if (!smb2) {
+                return -1;
+        }
+
+        fh = smb2_open(smb2, "cn-exist.txt", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create cn-exist.txt failed");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+
+        root = smb2_open(smb2, "", O_RDONLY);
+        if (!root) {
+                root = smb2_open(smb2, ".", O_RDONLY);
+        }
+        if (!root) {
+                set_err(err, errlen, smb2, "open share root failed");
+                goto out;
+        }
+
+        memset(&cn, 0, sizeof(cn));
+        cn.output_buffer_length = 4096;
+        memcpy(cn.file_id, smb2_get_file_id(root), SMB2_FD_SIZE);
+        cn.completion_filter = SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_FILE_NAME |
+                               SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_DIR_NAME;
+        pdu = smb2_cmd_change_notify_async(smb2, &cn, raw_cb, &rs);
+        if (!pdu) {
+                set_err(err, errlen, smb2, "CHANGE_NOTIFY alloc failed");
+                goto out;
+        }
+        memset(&rs, 0, sizeof(rs));
+        smb2_queue_pdu(smb2, pdu);
+
+        fh = smb2_open(smb2, "cn-exist.txt", O_RDWR);
+        if (!fh) {
+                set_err(err, errlen, smb2, "reopen cn-exist.txt failed");
+                goto out;
+        }
+        if (smb2_write(smb2, fh, (uint8_t *)buf, sizeof(buf)) < 0) {
+                set_err(err, errlen, smb2, "write cn-exist.txt failed");
+                smb2_close(smb2, fh);
+                goto out;
+        }
+        smb2_close(smb2, fh);
+
+        if (wait_for_cb_timeout(smb2, &rs, 400) == 0) {
+                snprintf(err, (size_t)errlen, "CHANGE_NOTIFY completed on WRITE status 0x%x",
+                         (unsigned)rs.status);
+                goto out;
+        }
+
+        fh = smb2_open(smb2, "cn-new.txt", O_RDWR | O_CREAT);
+        if (!fh) {
+                set_err(err, errlen, smb2, "create cn-new.txt failed");
+                goto out;
+        }
+        smb2_close(smb2, fh);
+
+        if (wait_for_cb(smb2, &rs) != 0) {
+                snprintf(err, (size_t)errlen, "CHANGE_NOTIFY timed out after create");
+                goto out;
+        }
+        if (rs.status != (int)SMB2_STATUS_NOTIFY_ENUM_DIR) {
+                snprintf(err, (size_t)errlen, "CHANGE_NOTIFY after create status 0x%x",
+                         (unsigned)rs.status);
+                goto out;
+        }
+
+        set_err(err, errlen, NULL, NULL);
+        rc = 0;
+out:
+        if (root) {
+                smb2_close(smb2, root);
+        }
+        if (smb2) {
+                smb2_unlink(smb2, "cn-exist.txt");
+                smb2_unlink(smb2, "cn-new.txt");
                 smb2_disconnect_share(smb2);
                 smb2_destroy_context(smb2);
         }

@@ -132,6 +132,17 @@ sops=$(python3 -c "print(f'{$SMALL_FILES/$ssec:.0f}')")
 echo "small-creates $sops ops/s (${ssec}s for $SMALL_FILES)" >> "$RESULTS"
 echo "  ${sops} ops/s"
 
+say "SMALL FILES (${SMALL_FILES} deletes)"
+st0=$(python3 -c 'import time; print(time.time())')
+for i in $(seq $SMALL_FILES); do
+  rm -f "$BENCH_DIR/small-$i.txt"
+done
+st1=$(python3 -c 'import time; print(time.time())')
+ssec=$(python3 -c "print(f'{$st1-$st0:.3f}')")
+sops=$(python3 -c "print(f'{$SMALL_FILES/$ssec:.0f}')")
+echo "small-deletes $sops ops/s (${ssec}s for $SMALL_FILES)" >> "$RESULTS"
+echo "  ${sops} ops/s"
+
 say "cleanup"
 rm -rf "$BENCH_DIR"
 

@@ -3478,6 +3478,10 @@ smb2_server_status_from_errno(enum smb2_command cmd, int ret)
                 return SMB2_STATUS_FILE_CLOSED;
         case ENOMEM:
                 return SMB2_STATUS_INSUFFICIENT_RESOURCES;
+        case ENOTEMPTY:
+                return SMB2_STATUS_DIRECTORY_NOT_EMPTY;
+        case EEXIST:
+                return SMB2_STATUS_OBJECT_NAME_COLLISION;
         case ENOMSG:
                 if (cmd == SMB2_CHANGE_NOTIFY) {
                         return SMB2_STATUS_NOTIFY_ENUM_DIR;

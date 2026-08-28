@@ -1,0 +1,29 @@
+diff --git a/Vendor/libsmb2/include/smb2/smb2-errors.h b/Vendor/libsmb2/include/smb2/smb2-errors.h
+index 1ff2ba2..0369e5b 100644
+--- a/Vendor/libsmb2/include/smb2/smb2-errors.h
++++ b/Vendor/libsmb2/include/smb2/smb2-errors.h
+@@ -36,7 +36,8 @@
+ #define SMB2_STATUS_SUCCESS                            0x00000000
+ #define SMB2_STATUS_SHUTDOWN                           0xffffffff
+ #define SMB2_STATUS_PENDING                            0x00000103
+-#define SMB2_STATUS_NOTIFY_ENUM_DIR                    0x000C10B8
++#define SMB2_STATUS_NOTIFY_CLEANUP                     0x0000010B
++#define SMB2_STATUS_NOTIFY_ENUM_DIR                    0x0000010C
+ #define SMB2_STATUS_SMB_BAD_FID                        0x00060001
+ #define SMB2_STATUS_NO_MORE_FILES                      0x80000006
+ #define SMB2_STATUS_UNSUCCESSFUL                       0xC0000001
+diff --git a/Vendor/libsmb2/lib/libsmb2.c b/Vendor/libsmb2/lib/libsmb2.c
+index c96f897..7cea093 100644
+--- a/Vendor/libsmb2/lib/libsmb2.c
++++ b/Vendor/libsmb2/lib/libsmb2.c
+@@ -3478,6 +3478,10 @@ smb2_server_status_from_errno(enum smb2_command cmd, int ret)
+                 return SMB2_STATUS_FILE_CLOSED;
+         case ENOMEM:
+                 return SMB2_STATUS_INSUFFICIENT_RESOURCES;
++        case ENOTEMPTY:
++                return SMB2_STATUS_DIRECTORY_NOT_EMPTY;
++        case EEXIST:
++                return SMB2_STATUS_OBJECT_NAME_COLLISION;
+         case ENOMSG:
+                 if (cmd == SMB2_CHANGE_NOTIFY) {
+                         return SMB2_STATUS_NOTIFY_ENUM_DIR;

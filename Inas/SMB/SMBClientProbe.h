@@ -80,6 +80,18 @@ int inas_smb_client_query_dir_classes(const char *host, uint16_t port, const cha
                                       const char *password, const char *share, char *err,
                                       int errlen);
 
+/* SET_INFO edges Finder hits: name gone after disposition (before CLOSE),
+ * non-empty directory → DIRECTORY_NOT_EMPTY, rename collision. */
+int inas_smb_client_setinfo_delete_edges(const char *host, uint16_t port, const char *user,
+                                         const char *password, const char *share, char *err,
+                                         int errlen);
+
+/* CHANGE_NOTIFY stays pending across WRITE and completes with
+ * NOTIFY_ENUM_DIR when a name is created. */
+int inas_smb_client_change_notify_mutate(const char *host, uint16_t port, const char *user,
+                                         const char *password, const char *share, char *err,
+                                         int errlen);
+
 #endif /* DEBUG */
 
 #ifdef __cplusplus
