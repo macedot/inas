@@ -2116,13 +2116,15 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 }
         }
         if (!h->dir) {
-                /* Fresh open (independent offset) rather than dup: see the
-                 * root-handle note in open_path. */
-                int dfd = openat(h->dirfd, h->leaf[0] ? h->leaf : ".",
-                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                /* h->fd is this handle's own open (independent offset since
+                 * the root-handle fix), so dup is safe here; openat by path
+                 * only as a fallback for handles without an fd. */
+                int dfd = h->fd >= 0 ? dup(h->fd)
+                                     : openat(h->dirfd, h->leaf[0] ? h->leaf : ".",
+                                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
                 if (dfd < 0) {
                         pthread_mutex_unlock(&fs->lock);
-                        return -errno;
+                        return -1;
                 }
                 h->dir = fdopendir(dfd);
                 if (!h->dir) {
@@ -2245,24 +2247,15 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 /* Spec-mandated empty-result statuses: clients (smbclient)
                  * treat SUCCESS-with-no-entries as an abnormal result.
                  * Continuation past the end -> NO_MORE_FILES; a first
-                 * query that matched nothing -> NO_SUCH_FILE. */
-                struct smb2_error_reply err;
-                struct smb2_pdu *epdu;
-                uint32_t status =
-                    h->enum_index > 0 ? SMB2_STATUS_NO_MORE_FILES : SMB2_STATUS_NO_SUCH_FILE;
-
+                 * query that matched nothing -> NO_SUCH_FILE. The status
+                 * rides back to the dispatcher as a sentinel in the
+                 * unsigned output_buffer_length (the reply is built there
+                 * AFTER the request's name buffer is freed - queueing a
+                 * reply from inside the handler crashed here). */
                 h->enum_done = 1;
-                pthread_mutex_unlock(&fs->lock);
-                memset(&err, 0, sizeof(err));
-                epdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_QUERY_DIRECTORY, status, NULL,
-                                                  NULL);
-                if (epdu != NULL) {
-                        smb2_set_pdu_message_id(smb2, epdu, smb2_get_last_request_message_id(smb2));
-                        smb2_queue_pdu(smb2, epdu);
-                        return 1;
-                }
                 rep->output_buffer = NULL;
-                rep->output_buffer_length = 0;
+                rep->output_buffer_length = (h->enum_index > 0) ? 0xFFFFFFFFu : 0xFFFFFFFEu;
+                pthread_mutex_unlock(&fs->lock);
                 return 0;
         }
 #ifdef INAS_DEFER_DEBUG
