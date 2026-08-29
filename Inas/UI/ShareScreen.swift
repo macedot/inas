@@ -41,20 +41,21 @@ struct ShareScreen: View {
             .navigationTitle("iNAS")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Text("v\(appVersion)")
-                        .font(.system(.caption, design: .rounded).weight(.semibold))
-                        .foregroundStyle(.tertiary)
-                        .accessibilityLabel("Version \(appVersion)")
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showSettings = true
-                    } label: {
-                        Image(systemName: "gearshape")
-                            .font(.body.weight(.semibold))
+                if #available(iOS 26.0, *) {
+                    ToolbarItem(placement: .topBarLeading) {
+                        versionLabel
                     }
-                    .accessibilityLabel("Settings")
+                    .sharedBackgroundVisibility(.hidden)
+                    ToolbarItem(placement: .topBarTrailing) {
+                        settingsButton
+                    }
+                } else {
+                    ToolbarItem(placement: .topBarLeading) {
+                        versionLabel
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        settingsButton
+                    }
                 }
             }
             .sheet(isPresented: $showSettings) {
@@ -66,6 +67,23 @@ struct ShareScreen: View {
 
     private var appVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.1"
+    }
+
+    private var versionLabel: some View {
+        Text("v\(appVersion)")
+            .font(.system(.caption, design: .rounded).weight(.semibold))
+            .foregroundStyle(.tertiary)
+            .accessibilityLabel("Version \(appVersion)")
+    }
+
+    private var settingsButton: some View {
+        Button {
+            showSettings = true
+        } label: {
+            Image(systemName: "gearshape")
+                .font(.body.weight(.semibold))
+        }
+        .accessibilityLabel("Settings")
     }
 
     @State private var connectionExpanded = true
