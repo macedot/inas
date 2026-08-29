@@ -45,6 +45,9 @@ final class ShareController {
     var bytesTransferred: UInt64 = 0
     var stats = ShareStats()
     private var lastStatsTotal: UInt64 = 0
+    /// Consecutive watchdog ticks where the LAN IP differed from the
+    /// endpoint; the share only stops after a sustained mismatch.
+    private var watchdogStrikes = 0
 
     init(
         store: CredentialStore = CredentialStore(),
@@ -315,12 +318,22 @@ final class ShareController {
         let simNoWatchdog = false
         #endif
         lastStatsTotal = 0
+        watchdogStrikes = 0
         statsTimer?.invalidate()
         let tick: () -> Void = { [weak self] in
             guard let self else { return }
             if !simNoWatchdog, let expected = self.endpoint?.ip, self.lan.lanIPv4() != expected {
-                self.stop(notify: true)
-                return
+                // A transient radio blip or DHCP renew makes lanIPv4()
+                // differ (or vanish) for a tick or two; killing the share
+                // mid-copy for that aborts GNOME clients. Stop only once
+                // the address has stayed wrong for ~5s (20 x 0.25s).
+                watchdogStrikes += 1
+                if watchdogStrikes >= 20 {
+                    self.stop(notify: true)
+                    return
+                }
+            } else {
+                watchdogStrikes = 0
             }
             self.clientCount = self.server.clientCount
             self.bytesTransferred = self.server.bytesTransferred

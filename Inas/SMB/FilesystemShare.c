@@ -1535,6 +1535,21 @@ static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
 {
 
         ioperf(smb2, "CREATE", "entry", smb2_get_last_request_message_id(smb2));
+#ifdef INAS_DEFER_DEBUG
+        {
+                char path[512];
+                FILE *df;
+                const char *tmp = getenv("HOME");
+                snprintf(path, sizeof(path), "%s/Documents/ioperf-debug.log", tmp ? tmp : "/tmp");
+                df = fopen(path, "a");
+                if (df) {
+                        fprintf(df, "CREATE name=[%s] disp=%u opts=%08x acc=%08x\n",
+                                req->name ? req->name : "(null)", req->create_disposition,
+                                req->create_options, req->desired_access);
+                        fclose(df);
+                }
+        }
+#endif
         struct inas_state *fs = fs_state(srvr);
         const char *name = req->name ? req->name : "";
         uint32_t tid = smb2_tree_id(smb2);
@@ -1679,6 +1694,19 @@ static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
         struct stat st;
         memset(&st, 0, sizeof(st));
         int err = open_path(h, rootfd, open_name, req, &st);
+#ifdef INAS_DEFER_DEBUG
+        {
+                char path[512];
+                FILE *df;
+                const char *tmp = getenv("HOME");
+                snprintf(path, sizeof(path), "%s/Documents/ioperf-debug.log", tmp ? tmp : "/tmp");
+                df = fopen(path, "a");
+                if (df) {
+                        fprintf(df, "CREATE => err=%d name=[%s]\n", err, open_name);
+                        fclose(df);
+                }
+        }
+#endif
         if (err != 0) {
                 handle_free(fs, h, 0);
                 pthread_mutex_unlock(&fs->lock);
@@ -2255,6 +2283,20 @@ static int query_directory_cmd(struct smb2_server *srvr, struct smb2_context *sm
                 h->enum_done = 1;
                 rep->output_buffer = NULL;
                 rep->output_buffer_length = (h->enum_index > 0) ? 0xFFFFFFFFu : 0xFFFFFFFEu;
+#ifdef INAS_DEFER_DEBUG
+                {
+                        char path[512];
+                        FILE *df;
+                        const char *tmp = getenv("HOME");
+                        snprintf(path, sizeof(path), "%s/Documents/ioperf-debug.log",
+                                 tmp ? tmp : "/tmp");
+                        df = fopen(path, "a");
+                        if (df) {
+                                fprintf(df, "QDIR => EMPTY (status sentinel)\n");
+                                fclose(df);
+                        }
+                }
+#endif
                 pthread_mutex_unlock(&fs->lock);
                 return 0;
         }
