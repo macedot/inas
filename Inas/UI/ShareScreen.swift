@@ -38,17 +38,15 @@ struct ShareScreen: View {
             .frame(maxWidth: 560)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(background.ignoresSafeArea())
-            .overlay(alignment: .topLeading) {
-                Text("v\(appVersion)")
-                    .font(.system(.caption, design: .rounded).weight(.semibold))
-                    .foregroundStyle(.tertiary)
-                    .padding(.top, 6)
-                    .padding(.leading, 24)
-                    .accessibilityLabel("Version \(appVersion)")
-            }
             .navigationTitle("iNAS")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Text("v\(appVersion)")
+                        .font(.system(.caption, design: .rounded).weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityLabel("Version \(appVersion)")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showSettings = true

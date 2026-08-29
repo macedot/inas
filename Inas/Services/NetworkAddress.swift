@@ -16,10 +16,13 @@ enum NetworkAddress {
         pick(interfaces())
     }
 
-    /// Wi-Fi (`en*`) first, then a bridge; never loopback, cellular, or AWDL.
+    /// Wi-Fi (`en*`) first, then a bridge; never loopback, cellular, AWDL,
+    /// or link-local (169.254.x - the self-assigned address a Wi-Fi drop
+    /// leaves behind, which no other host can reach).
     static func pick(_ interfaces: [Interface]) -> String? {
         let usable = interfaces.filter { iface in
             guard iface.up, !iface.loopback else { return false }
+            guard !iface.ip.hasPrefix("169.254.") else { return false }
             return iface.name.hasPrefix("en") || iface.name.hasPrefix("bridge")
         }
         if let wifi = usable.first(where: { $0.name.hasPrefix("en") }) {
